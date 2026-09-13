@@ -171,6 +171,22 @@ def save_routers():
 
 app_config = load_config()
 LOCAL_API_KEY = app_config.get("local_api_key")
+ADMIN_PASSWORD = app_config.get("admin_password", "")
+
+
+def _check_basic_auth(authorization: str) -> bool:
+    """Basic Auth 检查（admin / ADMIN_PASSWORD）"""
+    if not authorization or not authorization.startswith("Basic "):
+        return False
+    try:
+        import base64
+        decoded = base64.b64decode(authorization[6:].strip()).decode("utf-8", errors="ignore")
+        username, _, password = decoded.partition(":")
+        if not ADMIN_PASSWORD:
+            return False
+        return username == "admin" and password == ADMIN_PASSWORD
+    except Exception:
+        return False
 ROUTERS = load_routers()
 
 meta = load_meta()
@@ -194,13 +210,14 @@ def verify_client(credentials: HTTPAuthorizationCredentials = Depends(security))
     return credentials
 
 
-def verify_admin(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """管理面板调用 /api/* 的鉴权，直接使用 local_api_key"""
-    if not credentials:
-        raise HTTPException(status_code=401, detail="Missing credentials")
-    if credentials.credentials != LOCAL_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return credentials
+def verify_admin(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """管理面板调用 /api/* 的鉴权：接受 Basic(admin/ADMIN_PASSWORD) 或 Bearer(local_api_key)"""
+    if credentials and credentials.credentials == LOCAL_API_KEY:
+        return credentials
+    auth_header = request.headers.get("Authorization", "")
+    if _check_basic_auth(auth_header):
+        return credentials
+    raise HTTPException(status_code=401, detail="Invalid credentials")
 
 
 # ============================================================
@@ -304,11 +321,51 @@ def _cleanup_call_log_sync():
 _active_key_index: dict = {}     # provider_name -> 当前活跃 Key 的索引
 _key_consecutive_fails: dict = {} # provider_name -> 当前 Key 的连续失败次数
 _key_rr_counters: dict = {}      # provider_name -> 轮询计数器
+# 坏 Key 黑名单：provider_name -> {key: 解禁时间戳}，认证类失败直接拉黑，select_key 自动跳过
+_key_blacklist: dict = {}
+KEY_BLACKLIST_SECONDS = 600
 
 VALID_KEY_STRATEGIES = {"sticky", "round_robin", "random", "first"}
 
 def _get_keys(provider):
     return provider.get("api_keys", [])
+
+def _key_banned(name: str, key: str) -> bool:
+    until = _key_blacklist.get(name, {}).get(key, 0)
+    return time.time() < until
+
+def blacklist_key(provider: dict, key: str):
+    """把一个坏 Key 拉黑 KEY_BLACKLIST_SECONDS 秒（select_key 会跳过）"""
+    if not key:
+        return
+    name = provider["name"]
+    bl = _key_blacklist.setdefault(name, {})
+    # 顺手清掉过期条目，防止 dict 无限增长
+    now = time.time()
+    for kk in [kk for kk, ts in bl.items() if ts <= now]:
+        del bl[kk]
+    bl[key] = now + KEY_BLACKLIST_SECONDS
+    logger.warning("Key 拉黑 [%s]: %s（%ds 内不再使用）", name, mask_key(key), KEY_BLACKLIST_SECONDS)
+
+def _available_keys(provider: dict) -> list:
+    """返回未被拉黑的 Key；若全部拉黑则临时放行（宁可再撞墙也不返回空）"""
+    keys = _get_keys(provider)
+    if not keys:
+        return []
+    name = provider["name"]
+    ok = [k for k in keys if not _key_banned(name, k)]
+    return ok if ok else keys
+
+def inject_provider_order(provider: dict, req_body: dict) -> dict:
+    """若 provider 配置了 provider_order，自动注入 provider.order 路由策略。
+    仅在请求未显式指定 provider 策略时注入，避免覆盖客户端主动传的配置。"""
+    order = provider.get("provider_order")
+    if order:
+        provider_cfg = req_body.get("provider")
+        if not isinstance(provider_cfg, dict) or "order" not in provider_cfg:
+            req_body.setdefault("provider", {})
+            req_body["provider"]["order"] = order
+    return req_body
 
 def _get_strategy(provider: dict) -> str:
     s = provider.get("key_strategy", "sticky")
@@ -323,35 +380,45 @@ def select_key(provider: dict) -> str:
     strategy = _get_strategy(provider)
 
     if strategy == "round_robin":
-        idx = _key_rr_counters.get(name, 0)
-        _key_rr_counters[name] = (idx + 1) % len(keys)
-        return keys[idx]
+        pool = _available_keys(provider)
+        idx = _key_rr_counters.get(name, 0) % len(pool)
+        _key_rr_counters[name] = idx + 1
+        return pool[idx]
 
     if strategy == "random":
-        return random.choice(keys)
+        return random.choice(_available_keys(provider))
 
     if strategy == "first":
         return keys[0]
 
-    # sticky（默认）：返回当前粘性 Key
+    # sticky（默认）：返回当前粘性 Key；黑名单里的坏 Key 自动跳过并前移指针
     idx = _active_key_index.get(name, 0)
     if idx >= len(keys):
         idx = 0
-        _active_key_index[name] = 0
-    return keys[idx]
+    for _ in range(len(keys)):
+        if not _key_banned(name, keys[idx % len(keys)]):
+            break
+        idx = idx + 1
+    _active_key_index[name] = idx % len(keys)
+    return keys[idx % len(keys)]
 
 def on_key_success(provider: dict):
     """调用成功，重置当前 Key 的失败计数（仅 sticky 用）"""
     name = provider["name"]
     _key_consecutive_fails[name] = 0
 
-def on_key_failure(provider: dict, status_code: int = None):
-    """调用失败，累计失败次数。429 或连续 3 次失败就切换 Key（仅 sticky 用）"""
+def on_key_failure(provider: dict, status_code: int | None = None, bad_key: str | None = None):
+    """调用失败，累计失败次数。
+    401/403 认证失败 → 立即切换 + 拉黑坏 Key；429 → 立即切换；其他连续 3 次才切（仅 sticky 用）"""
     name = provider["name"]
     keys = _get_keys(provider)
     if not keys:
         return
-    # 非 sticky 策略不需要粘性计数
+    # 认证失败与坏 Key 拉黑对所有策略生效（round_robin/random 一样会反复选中坏 Key）
+    if status_code in AUTH_ERROR_CODES:
+        if bad_key:
+            blacklist_key(provider, bad_key)
+    # 非 sticky 策略不需要粘性指针切换
     if _get_strategy(provider) != "sticky":
         return
 
@@ -359,14 +426,24 @@ def on_key_failure(provider: dict, status_code: int = None):
     _key_consecutive_fails[name] = fails
 
     is_429 = status_code == 429
-    should_switch = is_429 or fails >= 3
+    is_auth = status_code in AUTH_ERROR_CODES
+    should_switch = is_429 or is_auth or fails >= 3
 
     if should_switch:
         current_idx = _active_key_index.get(name, 0)
-        next_idx = (current_idx + 1) % len(keys)
+        next_idx = current_idx
+        for _ in range(len(keys)):
+            next_idx = (next_idx + 1) % len(keys)
+            if not _key_banned(name, keys[next_idx]):
+                break
         _active_key_index[name] = next_idx
         _key_consecutive_fails[name] = 0
-        reason = "429 限流" if is_429 else f"连续 {fails} 次失败"
+        if is_auth:
+            reason = f"认证失败 {status_code}，坏 Key 已拉黑 {KEY_BLACKLIST_SECONDS}s"
+        elif is_429:
+            reason = "429 限流"
+        else:
+            reason = f"连续 {fails} 次失败"
         logger.info("Key 切换 [%s]: %s → %s（%s）", name, mask_key(keys[current_idx]), mask_key(keys[next_idx]), reason)
 
 # ============================================================
@@ -374,11 +451,13 @@ def on_key_failure(provider: dict, status_code: int = None):
 # ============================================================
 # 请求体本身有问题 → 换 Key 无用，不切 Key、不熔断，直接透传错误
 REQUEST_ERROR_CODES = {400, 404, 405, 409, 413, 415, 422}
-# Key 认证失败 → 下一个 Key 可能有效，切 Key + 熔断
+# Key 认证失败 → 下一个 Key 可能有效，拉黑坏 Key + 换 Key 重试
 AUTH_ERROR_CODES = {401, 403}
+# 账号余额/权限问题 → 换 Key 无用（账号级），冷却整个 provider，直接路由下一个候选
+BILLING_ERROR_CODES = {402}
 
 def classify_failure(status_code: int | None) -> str:
-    """'request' | 'auth' | 'quota' | 'server' | 'connect'"""
+    """'request' | 'auth' | 'quota' | 'billing' | 'server' | 'connect'"""
     if status_code is None:
         return "connect"
     if status_code in REQUEST_ERROR_CODES:
@@ -387,14 +466,17 @@ def classify_failure(status_code: int | None) -> str:
         return "auth"
     if status_code == 429:
         return "quota"
+    if status_code in BILLING_ERROR_CODES:
+        return "billing"
     return "server"
 
 # 429 很可能是 IP 级限流，换 Key 也无效 → provider 级冷却，避免空转切完所有 Key
 _provider_429_cooldown: dict = {}
 PROVIDER_429_COOLDOWN_SECONDS = 180
+PROVIDER_BILLING_COOLDOWN_SECONDS = 1800  # 402 余额不足：冷却 30 分钟，避免反复撞墙
 
-def mark_provider_429(provider: dict):
-    _provider_429_cooldown[provider["name"]] = time.time() + PROVIDER_429_COOLDOWN_SECONDS
+def mark_provider_429(provider: dict, seconds: int = PROVIDER_429_COOLDOWN_SECONDS):
+    _provider_429_cooldown[provider["name"]] = time.time() + seconds
 
 def is_provider_429_cooling(provider: dict) -> bool:
     return time.time() < _provider_429_cooldown.get(provider["name"], 0)
@@ -858,8 +940,9 @@ async def poll_all():
     poll_stage = "fetching_models"
     async def fetch_one(p):
         try:
-            keys = p.get("api_keys", [])
-            ak = keys[0] if keys else ""
+            # 探测用「第一个未被拉黑的 Key」，避免坏 Key[0] 把整个 provider 误判为不健康
+            pool = _available_keys(p)
+            ak = pool[0] if pool else ""
             return await fetch_model_details(p["base_url"], ak)
         except Exception:
             logger.exception("model_details fetch failed: %s", p.get("name"))
@@ -1107,6 +1190,11 @@ def ensure_lang_reply(body: dict) -> dict:
 # ============================================================
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
+    auth_header = request.headers.get("Authorization", "")
+    is_authorized = _check_basic_auth(auth_header) or auth_header == f"Bearer {LOCAL_API_KEY}"
+    if not is_authorized:
+        from fastapi.responses import Response
+        return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="model-gateway"'})
     ctx = {
         "request": request,
         "local_api_key": LOCAL_API_KEY,
@@ -1865,8 +1953,10 @@ async def manual_check(name: str, model: str, _=Depends(verify_admin)):
 async def check_all(_=Depends(verify_admin)):
     tasks = []
     for p in list(providers):
+        _pool = _available_keys(p)
+        _probe_key = _pool[0] if _pool else ""
         for m in get_enabled_models(p):
-            tasks.append((p["name"], m, p["base_url"], (p.get("api_keys", [""])[0] if p.get("api_keys") else "")))
+            tasks.append((p["name"], m, p["base_url"], _probe_key))
     results = await run_health_checks(tasks)
     health_status.update(results)
     await append_history(results)
@@ -2048,6 +2138,7 @@ async def _stream_with_failover(candidates, body, is_router, prelude: str = ""):
         accumulated = ""
         prefix_done = False
         max_attempts = 2 if is_router else 1
+        last_request_err = None  # 400 类错误：全部候选失败后才透出给客户端
 
         if prelude:
             yield "data: " + json.dumps({"choices": [{"delta": {"content": prelude}, "index": 0}]}, ensure_ascii=False) + "\n\n"
@@ -2063,77 +2154,129 @@ async def _stream_with_failover(candidates, body, is_router, prelude: str = ""):
                     logger.info("provider %s 429 冷却中，跳过", provider["name"])
                     continue
                 k = f"{provider['name']}||{model}"
-                req_body = copy.deepcopy(body)
-                req_body["model"] = MODEL_ALIASES.get(model, model)
 
-                if accumulated:
-                    msgs = list(req_body.get("messages", []))
-                    msgs.append({"role": "assistant", "content": accumulated})
-                    msgs.append({"role": "user", "content": "请继续上面的回复，从中断处接着写。"})
-                    req_body["messages"] = msgs
+                # Key 级重试：任何 Key 侧错误（429/401/403/5xx/连接失败）都换下一个 Key
+                # 重试当前请求，前端无感；全部 Key 试完才冷却 provider / 路由下一候选。
+                # 402 是账号级问题（余额），换 Key 无用 → 直接长冷却 + 下一候选。
+                keys = _get_keys(provider)
+                max_key_tries = max(1, len(keys))
+                key_tried = 0
+                used_key = None
+                resp = None
+                while key_tried < max_key_tries:
+                    key_tried += 1
+                    req_body = copy.deepcopy(body)
+                    req_body["model"] = MODEL_ALIASES.get(model, model)
+                    inject_provider_order(provider, req_body)
 
-                url = provider["base_url"].rstrip("/") + "/chat/completions"
-                headers = {
-                    "Authorization": f"Bearer {select_key(provider)}",
-                    "Content-Type": "application/json",
-                }
+                    if accumulated:
+                        msgs = list(req_body.get("messages", []))
+                        msgs.append({"role": "assistant", "content": accumulated})
+                        msgs.append({"role": "user", "content": "请继续上面的回复，从中断处接着写。"})
+                        req_body["messages"] = msgs
 
-                req = http_client.build_request("POST", url, json=req_body, headers=headers)
-                try:
-                    resp = await http_client.send(req, stream=True)
-                except httpx.RequestError as e:
-                    logger.warning("stream connect error to %s: %s", provider["name"], e)
-                    record_fail(k)
-                    on_key_failure(provider)
-                    append_call_log({
-                        "time": time.strftime("%H:%M:%S"),
-                        "provider": provider["name"],
-                        "model": model,
-                        "status": "fail",
-                        "tokens": 0,
-                        "error": "连接失败",
-                    })
-                    continue
+                    used_key = select_key(provider)
+                    url = provider["base_url"].rstrip("/") + "/chat/completions"
+                    headers = {
+                        "Authorization": f"Bearer {used_key}",
+                        "Content-Type": "application/json",
+                    }
 
-                if resp.status_code != 200:
+                    req = http_client.build_request("POST", url, json=req_body, headers=headers)
                     try:
-                        await resp.aread()
-                    except Exception:
-                        pass
-                    await resp.aclose()
-                    ftype = classify_failure(resp.status_code)
-                    if ftype == "request":
-                        # 请求体问题：换 Key 无用，不切 Key、不熔断，直接结束流
-                        logger.warning("upstream stream error %d from %s (请求参数错误，不切换 Key)", resp.status_code, provider["name"])
+                        resp = await http_client.send(req, stream=True)
+                    except httpx.RequestError as e:
+                        logger.warning("stream connect error to %s: %s", provider["name"], e)
+                        record_fail(k)
+                        on_key_failure(provider, bad_key=used_key)
                         append_call_log({
                             "time": time.strftime("%H:%M:%S"),
                             "provider": provider["name"],
                             "model": model,
                             "status": "fail",
                             "tokens": 0,
-                            "error": f"HTTP {resp.status_code} 请求参数错误",
+                            "error": "连接失败",
                         })
-                        yield "data: " + json.dumps({
-                            "error": {"message": f"upstream {resp.status_code} 请求参数错误，请检查请求体", "type": "invalid_request_error", "code": resp.status_code},
-                        }, ensure_ascii=False) + "\n\n"
-                        return
-                    logger.warning("upstream stream error %d from %s", resp.status_code, provider["name"])
-                    if ftype == "quota":
-                        # 限流：切 Key + provider 冷却，防空转
-                        on_key_failure(provider, resp.status_code)
-                        mark_provider_429(provider)
-                    else:
-                        # 认证失败 / 服务故障：熔断 + 切 Key
+                        resp = None
+                        if key_tried < max_key_tries:
+                            logger.info("provider %s 连接失败，换下一个 Key 重试（%d/%d）", provider["name"], key_tried, max_key_tries)
+                            continue
+                        break
+
+                    if resp.status_code != 200:
+                        try:
+                            await resp.aread()
+                        except Exception:
+                            pass
+                        await resp.aclose()
+                        ftype = classify_failure(resp.status_code)
+                        if ftype == "request":
+                            # 请求体问题：换 Key 无用，但别家上游可能兼容该请求
+                            # → 不切 Key、不熔断，路由到下一候选；全部失败才把错误详情透出
+                            logger.warning("upstream stream error %d from %s (请求参数错误，路由下一候选)", resp.status_code, provider["name"])
+                            append_call_log({
+                                "time": time.strftime("%H:%M:%S"),
+                                "provider": provider["name"],
+                                "model": model,
+                                "status": "fail",
+                                "tokens": 0,
+                                "error": f"HTTP {resp.status_code} 请求参数错误",
+                            })
+                            last_request_err = f"upstream {resp.status_code}"
+                            resp = None
+                            break
+                        if ftype == "billing":
+                            # 402 余额/权限：账号级问题，换 Key 无用 → provider 长冷却，路由下一候选
+                            logger.warning("upstream stream error %d from %s (余额/权限，冷却 %ds 后路由下一候选)", resp.status_code, provider["name"], PROVIDER_BILLING_COOLDOWN_SECONDS)
+                            mark_provider_429(provider, PROVIDER_BILLING_COOLDOWN_SECONDS)
+                            append_call_log({
+                                "time": time.strftime("%H:%M:%S"),
+                                "provider": provider["name"],
+                                "model": model,
+                                "status": "fail",
+                                "tokens": 0,
+                                "error": f"HTTP {resp.status_code} 余额不足",
+                            })
+                            resp = None
+                            break
+                        logger.warning("upstream stream error %d from %s", resp.status_code, provider["name"])
+                        if ftype == "quota":
+                            # 限流：先切 Key 换下一个重试（无感切换），全部 Key 429 才冷却 provider
+                            on_key_failure(provider, resp.status_code, bad_key=used_key)
+                            append_call_log({
+                                "time": time.strftime("%H:%M:%S"),
+                                "provider": provider["name"],
+                                "model": model,
+                                "status": "fail",
+                                "tokens": 0,
+                                "error": f"HTTP {resp.status_code}",
+                            })
+                            if key_tried < max_key_tries:
+                                logger.info("provider %s 429 限流，换下一个 Key 重试（%d/%d）", provider["name"], key_tried, max_key_tries)
+                                continue
+                            mark_provider_429(provider)
+                            logger.info("provider %s 全部 %d 个 Key 均 429，冷却 %ds", provider["name"], max_key_tries, PROVIDER_429_COOLDOWN_SECONDS)
+                            break
+                        # 认证失败(401/403 拉黑坏Key) / 服务故障(5xx)：换 Key 重试当前请求
                         record_fail(k)
-                        on_key_failure(provider, resp.status_code)
-                    append_call_log({
-                        "time": time.strftime("%H:%M:%S"),
-                        "provider": provider["name"],
-                        "model": model,
-                        "status": "fail",
-                        "tokens": 0,
-                        "error": f"HTTP {resp.status_code}",
-                    })
+                        on_key_failure(provider, resp.status_code, bad_key=used_key)
+                        append_call_log({
+                            "time": time.strftime("%H:%M:%S"),
+                            "provider": provider["name"],
+                            "model": model,
+                            "status": "fail",
+                            "tokens": 0,
+                            "error": f"HTTP {resp.status_code}",
+                        })
+                        resp = None
+                        if key_tried < max_key_tries:
+                            logger.info("provider %s HTTP 错误，换下一个 Key 重试（%d/%d）", provider["name"], key_tried, max_key_tries)
+                            continue
+                        break
+                    else:
+                        break  # 200 成功
+
+                if resp is None or resp.status_code != 200:
                     continue
 
                 usage_obj = None
@@ -2202,7 +2345,7 @@ async def _stream_with_failover(candidates, body, is_router, prelude: str = ""):
                     stream_ok = False
                     logger.exception("stream interrupted from %s, switching", provider["name"])
                     record_fail(k)
-                    on_key_failure(provider)
+                    on_key_failure(provider, bad_key=used_key)
                     append_call_log({
                         "time": time.strftime("%H:%M:%S"),
                         "provider": provider["name"],
@@ -2223,7 +2366,8 @@ async def _stream_with_failover(candidates, body, is_router, prelude: str = ""):
                         except Exception:
                             pass
 
-        yield "data: " + json.dumps({"choices": [{"delta": {"content": "\n\n⚠️ 所有模型均失败，回复中断。"}, "index": 0}]}, ensure_ascii=False) + "\n\n"
+        err_note = f"（{last_request_err}）" if last_request_err else ""
+        yield "data: " + json.dumps({"choices": [{"delta": {"content": f"\n\n⚠️ 所有模型均失败{err_note}，回复中断。"}, "index": 0}]}, ensure_ascii=False) + "\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
@@ -2277,134 +2421,182 @@ async def proxy_chat(request: Request, force: bool = False):
                 logger.info("provider %s 429 冷却中，跳过", provider["name"])
                 continue
             k = f"{provider['name']}||{model}"
-            req_body = copy.deepcopy(body)
-            req_body["model"] = MODEL_ALIASES.get(model, model)
-            url = provider["base_url"].rstrip("/") + "/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {select_key(provider)}",
-                "Content-Type": "application/json",
-            }
 
-            try:
-                resp = await http_client.post(url, json=req_body, headers=headers, timeout=120)
-                if resp.status_code >= 400:
-                    ftype = classify_failure(resp.status_code)
-                    err_detail = resp.text[:300]
-                    logger.warning("upstream %d from %s: %s", resp.status_code, provider["name"], err_detail)
-                    if ftype == "request":
-                        # 请求体问题：换 Key 无用，不切 Key、不熔断，透传错误给客户端
-                        last_err = f"upstream {resp.status_code}: {err_detail}"
+            # Key 级重试：任何 Key 侧错误（429/401/403/5xx/连接失败）都换下一个 Key
+            # 重试当前请求，前端无感；全部 Key 试完才冷却 provider / 路由下一候选。
+            # 402 是账号级问题（余额），换 Key 无用 → 直接长冷却 + 下一候选。
+            keys = _get_keys(provider)
+            max_key_tries = max(1, len(keys))
+            key_tried = 0
+            used_key = None
+            while key_tried < max_key_tries:
+                key_tried += 1
+                req_body = copy.deepcopy(body)
+                req_body["model"] = MODEL_ALIASES.get(model, model)
+                inject_provider_order(provider, req_body)
+                used_key = select_key(provider)
+                url = provider["base_url"].rstrip("/") + "/chat/completions"
+                headers = {
+                    "Authorization": f"Bearer {used_key}",
+                    "Content-Type": "application/json",
+                }
+
+                try:
+                    resp = await http_client.post(url, json=req_body, headers=headers, timeout=120)
+                    if resp.status_code >= 400:
+                        ftype = classify_failure(resp.status_code)
+                        err_detail = resp.text[:300]
+                        logger.warning("upstream %d from %s: %s", resp.status_code, provider["name"], err_detail)
+                        if ftype == "request":
+                            # 请求体问题：换 Key 无用，不切 Key、不熔断，透传错误给客户端
+                            last_err = f"upstream {resp.status_code}: {err_detail}"
+                            append_call_log({
+                                "time": time.strftime("%H:%M:%S"),
+                                "provider": provider["name"],
+                                "model": model,
+                                "status": "fail",
+                                "tokens": 0,
+                                "error": f"HTTP {resp.status_code} 请求参数错误",
+                            })
+                            break
+                        if ftype == "billing":
+                            # 402 余额/权限：账号级问题，换 Key 无用 → provider 长冷却，路由下一候选
+                            mark_provider_429(provider, PROVIDER_BILLING_COOLDOWN_SECONDS)
+                            logger.info("provider %s 402 余额不足，冷却 %ds 后路由下一候选", provider["name"], PROVIDER_BILLING_COOLDOWN_SECONDS)
+                            last_err = f"upstream {resp.status_code}"
+                            append_call_log({
+                                "time": time.strftime("%H:%M:%S"),
+                                "provider": provider["name"],
+                                "model": model,
+                                "status": "fail",
+                                "tokens": 0,
+                                "error": f"HTTP {resp.status_code} 余额不足",
+                            })
+                            break
+                        if ftype == "quota":
+                            # 限流：先切 Key 换下一个重试（无感切换），全部 Key 429 才冷却 provider
+                            on_key_failure(provider, resp.status_code, bad_key=used_key)
+                            last_err = f"upstream {resp.status_code}"
+                            append_call_log({
+                                "time": time.strftime("%H:%M:%S"),
+                                "provider": provider["name"],
+                                "model": model,
+                                "status": "fail",
+                                "tokens": 0,
+                                "error": f"HTTP {resp.status_code}",
+                            })
+                            if key_tried < max_key_tries:
+                                logger.info("provider %s 429 限流，换下一个 Key 重试（%d/%d）", provider["name"], key_tried, max_key_tries)
+                                continue
+                            mark_provider_429(provider)
+                            logger.info("provider %s 全部 %d 个 Key 均 429，冷却 %ds", provider["name"], max_key_tries, PROVIDER_429_COOLDOWN_SECONDS)
+                            break
+                        # 认证失败(401/403 拉黑坏Key) / 服务故障(5xx)：换 Key 重试当前请求
+                        record_fail(k)
+                        on_key_failure(provider, resp.status_code, bad_key=used_key)
+                        last_err = f"upstream {resp.status_code}"
                         append_call_log({
                             "time": time.strftime("%H:%M:%S"),
                             "provider": provider["name"],
                             "model": model,
                             "status": "fail",
                             "tokens": 0,
-                            "error": f"HTTP {resp.status_code} 请求参数错误",
+                            "error": f"HTTP {resp.status_code}",
                         })
+                        if key_tried < max_key_tries:
+                            logger.info("provider %s HTTP %d，换下一个 Key 重试（%d/%d）", provider["name"], resp.status_code, key_tried, max_key_tries)
+                            continue
                         break
-                    if ftype == "quota":
-                        # 限流：切 Key（万一不是 IP 级），同时给 provider 冷却，防空转
-                        on_key_failure(provider, resp.status_code)
-                        mark_provider_429(provider)
-                    else:
-                        # 认证失败 / 服务故障 / 连接问题：熔断 + 切 Key
-                        record_fail(k)
-                        on_key_failure(provider, resp.status_code)
-                    last_err = f"upstream {resp.status_code}"
-                    append_call_log({
-                        "time": time.strftime("%H:%M:%S"),
-                        "provider": provider["name"],
-                        "model": model,
-                        "status": "fail",
-                        "tokens": 0,
-                        "error": f"HTTP {resp.status_code}",
-                    })
-                    continue
-                try:
-                    parsed = json.loads(resp.text)
-                    parsed = merge_reasoning(parsed)
-                    parsed_str = json.dumps(parsed, ensure_ascii=False)
-                    parsed_str = restore_hermes_text(parsed_str)
-                    parsed = json.loads(parsed_str)
-                    record_success(k)
-                    on_key_success(provider)
-                    parsed["model"] = model
                     try:
-                        u = parsed.get("usage") or {}
-                        pt = u.get("prompt_tokens", 0) or 0
-                        ct = u.get("completion_tokens", 0) or 0
-                        await append_usage({
-                            "ts": time.time(), "model": model,
-                            "provider": provider["name"],
-                            "pt": pt, "ct": ct, "tt": pt + ct,
-                        })
-                        # 调用日志记录
+                        parsed = json.loads(resp.text)
+                        parsed = merge_reasoning(parsed)
+                        parsed_str = json.dumps(parsed, ensure_ascii=False)
+                        parsed_str = restore_hermes_text(parsed_str)
+                        parsed = json.loads(parsed_str)
+                        record_success(k)
+                        on_key_success(provider)
+                        parsed["model"] = model
+                        try:
+                            u = parsed.get("usage") or {}
+                            pt = u.get("prompt_tokens", 0) or 0
+                            ct = u.get("completion_tokens", 0) or 0
+                            await append_usage({
+                                "ts": time.time(), "model": model,
+                                "provider": provider["name"],
+                                "pt": pt, "ct": ct, "tt": pt + ct,
+                            })
+                            # 调用日志记录
+                            append_call_log({
+                                "time": time.strftime("%H:%M:%S"),
+                                "provider": provider["name"],
+                                "model": model,
+                                "status": "ok",
+                                "tokens": pt + ct,
+                            })
+                        except Exception:
+                            logger.exception("append_usage(non-stream) failed")
+                        try:
+                            msg = parsed["choices"][0]["message"]
+                            c = msg.get("content")
+                            prefix_parts = []
+                            if vision_prelude:
+                                prefix_parts.append(vision_prelude.rstrip())
+                            prefix = "\n\n".join(prefix_parts)
+                            if isinstance(c, str) and c:
+                                msg["content"] = f"{prefix}\n\n{c}" if prefix else c
+                            elif isinstance(c, str):
+                                msg["content"] = prefix
+                        except (KeyError, IndexError, TypeError):
+                            pass
+                        return JSONResponse(content=parsed, status_code=resp.status_code)
+                    except json.JSONDecodeError:
+                        logger.warning("upstream non-json from %s: %s", provider["name"], resp.text[:200])
+                        record_fail(k)
+                        on_key_failure(provider, resp.status_code, bad_key=used_key)
+                        last_err = f"upstream non-json ({resp.status_code})"
                         append_call_log({
                             "time": time.strftime("%H:%M:%S"),
                             "provider": provider["name"],
                             "model": model,
-                            "status": "ok",
-                            "tokens": pt + ct,
+                            "status": "fail",
+                            "tokens": 0,
+                            "error": "响应格式错误",
                         })
-                    except Exception:
-                        logger.exception("append_usage(non-stream) failed")
-                    try:
-                        msg = parsed["choices"][0]["message"]
-                        c = msg.get("content")
-                        prefix_parts = []
-                        if vision_prelude:
-                            prefix_parts.append(vision_prelude.rstrip())
-                        prefix = "\n\n".join(prefix_parts)
-                        if isinstance(c, str) and c:
-                            msg["content"] = f"{prefix}\n\n{c}" if prefix else c
-                        elif isinstance(c, str):
-                            msg["content"] = prefix
-                    except (KeyError, IndexError, TypeError):
-                        pass
-                    return JSONResponse(content=parsed, status_code=resp.status_code)
-                except json.JSONDecodeError:
-                    logger.warning("upstream non-json from %s: %s", provider["name"], resp.text[:200])
+                        if key_tried < max_key_tries:
+                            logger.info("provider %s 响应非 JSON，换下一个 Key 重试（%d/%d）", provider["name"], key_tried, max_key_tries)
+                            continue
+                        break
+                except httpx.RequestError as e:
+                    logger.warning("forward error to %s: %s", provider["name"], e)
                     record_fail(k)
-                    on_key_failure(provider, resp.status_code)
-                    last_err = f"upstream non-json ({resp.status_code})"
+                    on_key_failure(provider, bad_key=used_key)
+                    last_err = str(e)
                     append_call_log({
                         "time": time.strftime("%H:%M:%S"),
                         "provider": provider["name"],
                         "model": model,
                         "status": "fail",
                         "tokens": 0,
-                        "error": "响应格式错误",
+                        "error": "连接失败",
                     })
-                    continue
-            except httpx.RequestError as e:
-                logger.warning("forward error to %s: %s", provider["name"], e)
-                record_fail(k)
-                on_key_failure(provider)
-                last_err = str(e)
-                append_call_log({
-                    "time": time.strftime("%H:%M:%S"),
-                    "provider": provider["name"],
-                    "model": model,
-                    "status": "fail",
-                    "tokens": 0,
-                    "error": "连接失败",
-                })
-                continue
-            except Exception as e:
-                logger.exception("unexpected forward error to %s", provider["name"])
-                record_fail(k)
-                on_key_failure(provider)
-                last_err = str(e)
-                append_call_log({
-                    "time": time.strftime("%H:%M:%S"),
-                    "provider": provider["name"],
-                    "model": model,
-                    "status": "fail",
-                    "tokens": 0,
-                    "error": "未知错误",
-                })
-                continue
+                    if key_tried < max_key_tries:
+                        logger.info("provider %s 连接失败，换下一个 Key 重试（%d/%d）", provider["name"], key_tried, max_key_tries)
+                        continue
+                    break
+                except Exception as e:
+                    logger.exception("unexpected forward error to %s", provider["name"])
+                    record_fail(k)
+                    on_key_failure(provider, bad_key=used_key)
+                    last_err = str(e)
+                    append_call_log({
+                        "time": time.strftime("%H:%M:%S"),
+                        "provider": provider["name"],
+                        "model": model,
+                        "status": "fail",
+                        "tokens": 0,
+                        "error": "未知错误",
+                    })
+                    break
 
     # 请求参数错误（400 等）：透传上游状态码与错误详情，方便客户端修正请求
     if isinstance(last_err, str) and last_err.startswith("upstream 4"):
