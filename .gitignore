@@ -24,6 +24,7 @@ status*.json
 stability.json
 gemini*.json
 test_sensenova*.json
+key_blacklist.json*
 
 # IDE/缓存
 .codebuddy/
@@ -32,8 +33,14 @@ test_sensenova*.json
 # AI 工作记录（内部使用，不公开）
 DEVLOG.md
 
-# 日志
+# 日志（含轮转文件 gateway.log.1 / .2 …）
 *.log
+*.log.*
+
+# 备份文件（可能含旧版真实凭据，一律不入库）
+*.bak
+*.bak-*
+*.backup
 
 # 调试/临时文件
 sse_raw*.txt

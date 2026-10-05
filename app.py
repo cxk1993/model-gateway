@@ -63,7 +63,7 @@ META_FILE = DATA_DIR / "models_meta.json"
 ROUTERS_FILE = DATA_DIR / "routers.json"
 ANNOUNCEMENT_FILE = DATA_DIR / "announcement.json"
 
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.8.0"
 
 MAX_HISTORY_DAYS = 30
 MAX_USAGE_DAYS = 720
@@ -171,6 +171,7 @@ def save_routers():
 
 app_config = load_config()
 LOCAL_API_KEY = app_config.get("local_api_key")
+# 未配置 admin_password 时留空 —— Basic 认证自动禁用，避免默认口令随源码公开
 ADMIN_PASSWORD = app_config.get("admin_password", "")
 
 
@@ -178,12 +179,12 @@ def _check_basic_auth(authorization: str) -> bool:
     """Basic Auth 检查（admin / ADMIN_PASSWORD）"""
     if not authorization or not authorization.startswith("Basic "):
         return False
+    if not ADMIN_PASSWORD:
+        return False                      # 未配置口令 → 禁用 Basic 认证
     try:
         import base64
         decoded = base64.b64decode(authorization[6:].strip()).decode("utf-8", errors="ignore")
         username, _, password = decoded.partition(":")
-        if not ADMIN_PASSWORD:
-            return False
         return username == "admin" and password == ADMIN_PASSWORD
     except Exception:
         return False
@@ -276,6 +277,109 @@ last_history_cleanup: float = 0
 
 # 调用日志（内存队列，最多保留 100 条）
 call_log = deque(maxlen=CALL_LOG_MAX)
+
+def _extract_cached_tokens(u: dict) -> int:
+    """从上游 usage 里提取「缓存命中」的 prompt token 数（兼容多家格式）。
+       Moonshot / OpenAI 系: usage.cached_tokens 或 usage.prompt_tokens_details.cached_tokens
+       DeepSeek: usage.prompt_cache_hit_tokens
+       Anthropic 风格: usage.cache_read_input_tokens
+       字段缺失或非数字一律返回 0。"""
+    if not isinstance(u, dict):
+        return 0
+    c = u.get("cached_tokens")
+    if not c:
+        d = u.get("prompt_tokens_details")
+        if isinstance(d, dict):
+            c = d.get("cached_tokens")
+    if not c:
+        c = u.get("prompt_cache_hit_tokens")
+    if not c:
+        c = u.get("cache_read_input_tokens")
+    try:
+        return int(c or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+# ============================================================
+# 上游未返回 usage 时的 token 兜底估算
+# ============================================================
+# 背景：部分上游的【流式】响应偶尔（约 1/4 概率）不回 usage 块。
+# 若不兜底，该次调用会被记成 0 token、统计缺失。这里按「字符数 / 4」粗估
+# （中英混排经验值，准确度约 ±30%），并在记录里打 estimated 标记，
+# 便于识别哪些是估算值。仅在上游 usage 完全缺失时兜底。
+TOKEN_ESTIMATE_CHARS_PER_TOKEN = 4
+
+
+def _estimate_tokens_from_text(text):
+    """按字符数粗估 token 数（中英混排取 4 字符 ≈ 1 token）。"""
+    if not text:
+        return 0
+    try:
+        return max(1, round(len(str(text)) / TOKEN_ESTIMATE_CHARS_PER_TOKEN))
+    except Exception:
+        return 0
+
+
+def _messages_to_text(messages):
+    """把 messages 拍平成纯文本，供无 usage 时估算 prompt token。"""
+    if not isinstance(messages, list):
+        return ""
+    parts = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            parts.append(c)
+        elif isinstance(c, list):
+            for seg in c:
+                if isinstance(seg, dict) and isinstance(seg.get("text"), str):
+                    parts.append(seg["text"])
+        tc = m.get("tool_calls")
+        if isinstance(tc, list):
+            for call in tc:
+                fn = (call or {}).get("function") or {}
+                parts.append(str(fn.get("name") or ""))
+                parts.append(str(fn.get("arguments") or ""))
+    return "\n".join(parts)
+
+
+def _extract_out_text(parsed):
+    """从响应 dict 取出助手输出文本（content + reasoning + tool_calls），供估算 ct。"""
+    try:
+        msg = parsed["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        return ""
+    parts = []
+    c = msg.get("content")
+    if isinstance(c, str):
+        parts.append(c)
+    rc = msg.get("reasoning_content")
+    if isinstance(rc, str):
+        parts.append(rc)
+    tcs = msg.get("tool_calls")
+    if isinstance(tcs, list):
+        for call in tcs:
+            fn = (call or {}).get("function") or {}
+            parts.append(str(fn.get("name") or ""))
+            parts.append(str(fn.get("arguments") or ""))
+    return "\n".join(parts)
+
+
+def _usage_or_estimate(usage_obj, req_messages, out_text):
+    """返回 (pt, ct, cached, estimated)。
+    usage 有效（pt 或 ct > 0）时原样返回；完全缺失时按字符数估算并置 estimated=True。"""
+    u = usage_obj or {}
+    pt = u.get("prompt_tokens", 0) or 0
+    ct = u.get("completion_tokens", 0) or 0
+    ch = _extract_cached_tokens(u)
+    if pt > 0 or ct > 0:
+        return pt, ct, ch, False
+    pt = _estimate_tokens_from_text(_messages_to_text(req_messages))
+    ct = _estimate_tokens_from_text(out_text)
+    return pt, ct, ch, bool(pt or ct)
+
 
 def _append_call_log_sync(entry: dict):
     """追加调用日志到文件（持久化）"""
@@ -392,15 +496,23 @@ def select_key(provider: dict) -> str:
         return keys[0]
 
     # sticky（默认）：返回当前粘性 Key；黑名单里的坏 Key 自动跳过并前移指针
-    idx = _active_key_index.get(name, 0)
-    if idx >= len(keys):
-        idx = 0
-    for _ in range(len(keys)):
-        if not _key_banned(name, keys[idx % len(keys)]):
+    # 修复（2026-09-23）：旧写法 `idx = idx + 1` 不归零，且 for 循环次数用尽后
+    # 会直接返回黑名单里的坏 key（凌晨 02:30 SenseNova 12 连击即此 bug）。
+    # 新写法：从指针处开始，最多绕一圈找到第一个未拉黑的 key；若全部拉黑，
+    # 返回指针当前位置（兜底放行），但绝不返回一个"本可避开"的坏 key。
+    n = len(keys)
+    idx = _active_key_index.get(name, 0) % n
+    chosen = None
+    for step in range(n):
+        cand = (idx + step) % n
+        if not _key_banned(name, keys[cand]):
+            chosen = cand
             break
-        idx = idx + 1
-    _active_key_index[name] = idx % len(keys)
-    return keys[idx % len(keys)]
+    if chosen is None:
+        # 全部拉黑：临时放行指针当前位置（宁可再撞墙也不返回空）
+        chosen = idx
+    _active_key_index[name] = chosen
+    return keys[chosen]
 
 def on_key_success(provider: dict):
     """调用成功，重置当前 Key 的失败计数（仅 sticky 用）"""
@@ -430,12 +542,21 @@ def on_key_failure(provider: dict, status_code: int | None = None, bad_key: str 
     should_switch = is_429 or is_auth or fails >= 3
 
     if should_switch:
-        current_idx = _active_key_index.get(name, 0)
-        next_idx = current_idx
-        for _ in range(len(keys)):
-            next_idx = (next_idx + 1) % len(keys)
-            if not _key_banned(name, keys[next_idx]):
+        # 修复（2026-09-23）：旧写法 next_idx 从 current_idx 起步、循环内才 +1，
+        # 而坏 key 已在上面 blacklist_key 拉黑——第一轮 +1 常恰好跳过坏 key 后
+        # 绕回原地，导致日志出现 "sk-XX → sk-XX" 自切换、指针空转。
+        # 新写法：明确从 current_idx 的下一格开始，绕一圈找第一个未拉黑的 key；
+        # 找不到（全黑）时退到 current_idx+1，保证指针一定前进。
+        n = len(keys)
+        current_idx = _active_key_index.get(name, 0) % n
+        next_idx = None
+        for step in range(1, n + 1):
+            cand = (current_idx + step) % n
+            if not _key_banned(name, keys[cand]):
+                next_idx = cand
                 break
+        if next_idx is None:
+            next_idx = (current_idx + 1) % n
         _active_key_index[name] = next_idx
         _key_consecutive_fails[name] = 0
         if is_auth:
@@ -445,6 +566,8 @@ def on_key_failure(provider: dict, status_code: int | None = None, bad_key: str 
         else:
             reason = f"连续 {fails} 次失败"
         logger.info("Key 切换 [%s]: %s → %s（%s）", name, mask_key(keys[current_idx]), mask_key(keys[next_idx]), reason)
+        if current_idx == next_idx:
+            logger.warning("Key 切换 [%s]: 指针未能前进（可能全部 Key 已拉黑），保持 idx=%d", name, current_idx)
 
 # ============================================================
 # 失败分类：区分请求问题 / Key 问题 / 限流 / 服务问题
@@ -497,6 +620,41 @@ def sanitize_messages(messages: list) -> list:
             m = {k: v for k, v in m.items() if k != "tool_calls"}
         out.append(m)
     return out
+
+def clamp_max_tokens(body: dict, model: str) -> dict:
+    """按 models_meta.json 的 max_output_limits 钳制 max_tokens。
+
+    背景：部分上游的 mimo-v2.6-flash 对 max_tokens > 131072
+    直接返回 HTTP 400 LITELLM_ERROR "Param Incorrect"。1m 等路由会带百万级
+    max_tokens，原样转给上游必然 400（表现为前端「请求参数错误」）。
+    这里在入口统一钳制，流式/非流式均覆盖。
+    仅在超限时改动，不覆盖客户端已传的合理值；无配置的模型不动。
+    """
+    if not isinstance(body, dict):
+        return body
+    limits = meta.get("max_output_limits", {}) if isinstance(meta, dict) else {}
+    if not limits:
+        return body
+    # 查表顺序：全名 → 后缀匹配（网关模型 ID 形如 "{provider}-{model}"）。
+    # 不能用 split("-",1) —— 当 provider 名自身含 "-" 时，
+    # 前缀会被切掉、后缀永远匹配不上。
+    cap = None
+    if model in limits:
+        cap = limits[model]
+    else:
+        for name, lim in limits.items():
+            if model == name or model.endswith("-" + name):
+                cap = lim
+                break
+    if not cap:
+        return body
+    for k in ("max_tokens", "max_completion_tokens"):
+        v = body.get(k)
+        if isinstance(v, int) and v > cap:
+            logger.info("clamp max_tokens for %s: %d -> %d", model, v, cap)
+            body[k] = cap
+    return body
+
 
 # 轮询计数（从 config 加载，poll_all 里增量更新）
 poll_count_state = app_config.get("poll_count", 0)
@@ -1012,7 +1170,16 @@ async def lifespan(app: FastAPI):
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
     )
     app.state.http = http_client
-    poll_task = asyncio.create_task(poll_all())
+    # ★ 健康探测总开关：默认**不启**探测。
+    #   poll_all() 每 300s 对所有启用模型发真实 chat 请求（"hi", max_tokens:5），
+    #   会产生额外的上游流量并消耗额度。
+    #   需要时在 config.json 写 {"health_poll_enabled": true} 并重启即可恢复。
+    if app_config.get("health_poll_enabled"):
+        poll_task = asyncio.create_task(poll_all())
+        logger.info("健康探测已启用（health_poll_enabled=true）")
+    else:
+        poll_task = None
+        logger.info("健康探测已关闭（health_poll_enabled 缺省）—— 不发起任何主动探测")
     yield
     if poll_task:
         poll_task.cancel()
@@ -1088,12 +1255,21 @@ def pick_available_models(model: str | None = None, force: bool = False) -> list
     
     # 如果请求的是自定义路由组
     if model in ROUTERS:
-        target_models = set(ROUTERS[model])
+        order = list(ROUTERS[model])          # 保留声明顺序（勿用 set 丢序）
+        target_models = set(order)
         for p in providers:
             for m in get_enabled_models(p):
                 if m in target_models:
                     k = f"{p['name']}||{m}"
                     raw.append((p, m, k))
+        # ★ 严格顺序模式（config.json: router_strict_order=true）
+        # 按 routers.json 成员的声明顺序返回候选：靠前的候选只有真正失败
+        # （连接错误 / 4xx / 5xx / 超时）才由 _stream_with_failover 顺延到下一个。
+        # 默认 false = 保持原有（可用率+延迟）排序。
+        if app_config.get("router_strict_order"):
+            idx = {name: i for i, name in enumerate(order)}
+            raw.sort(key=lambda x: idx.get(x[1], len(order)))
+            return [(p, m) for p, m, _ in raw]
         scored = [
             (get_quality_score(k), get_avg_latency(k) or 1e9, p, m)
             for p, m, k in raw
@@ -1286,7 +1462,7 @@ async def get_stability(hours: int = 24, _=Depends(verify_admin)):
 async def get_usage(days: int = 1, _=Depends(verify_admin)):
     days = max(1, min(days, get_usage_retention_days()))
     records = await read_usage(days)
-    total = {"pt": 0, "ct": 0, "tt": 0, "requests": 0}
+    total = {"pt": 0, "ct": 0, "tt": 0, "cache_pt": 0, "requests": 0}
     by_day = {}
     by_model = {}
     for r in records:
@@ -1295,26 +1471,31 @@ async def get_usage(days: int = 1, _=Depends(verify_admin)):
         pt = r.get("pt", 0) or 0
         ct = r.get("ct", 0) or 0
         tt = r.get("tt", 0) or (pt + ct)
+        cp = r.get("cache_pt", 0) or 0
         m = r.get("model", "unknown")
         p = r.get("provider", "unknown")
         total["pt"] += pt
         total["ct"] += ct
         total["tt"] += tt
+        total["cache_pt"] += cp
         total["requests"] += 1
-        d = by_day.setdefault(day, {"pt": 0, "ct": 0, "tt": 0, "requests": 0})
+        d = by_day.setdefault(day, {"pt": 0, "ct": 0, "tt": 0, "cache_pt": 0, "requests": 0})
         d["pt"] += pt
         d["ct"] += ct
         d["tt"] += tt
+        d["cache_pt"] += cp
         d["requests"] += 1
         mk = f"{p} · {m}"
-        mm = by_model.setdefault(mk, {"pt": 0, "ct": 0, "tt": 0, "requests": 0, "provider": p, "model": m})
+        mm = by_model.setdefault(mk, {"pt": 0, "ct": 0, "tt": 0, "cache_pt": 0, "requests": 0, "provider": p, "model": m})
         mm["pt"] += pt
         mm["ct"] += ct
         mm["tt"] += tt
+        mm["cache_pt"] += cp
         mm["requests"] += 1
     by_day_list = [{"date": d, **v} for d, v in sorted(by_day.items())]
     by_model_list = [
-        {"provider": v["provider"], "model": v["model"], "pt": v["pt"], "ct": v["ct"], "tt": v["tt"], "requests": v["requests"]}
+        {"provider": v["provider"], "model": v["model"], "pt": v["pt"], "ct": v["ct"],
+         "tt": v["tt"], "cache_pt": v["cache_pt"], "requests": v["requests"]}
         for _, v in sorted(by_model.items(), key=lambda x: -x[1]["tt"])
     ]
     return {"days": days, "total": total, "by_day": by_day_list, "by_model": by_model_list}
@@ -1406,7 +1587,9 @@ async def vision_models_api(_=Depends(verify_admin)):
 
 
 # ---------- 系统公告（Gitee 远程，本地兜底） ----------
-DEFAULT_ANNOUNCEMENT_URL = "https://gitee.com/ywtc000/dongye/raw/master/announcement.md"
+# ★ 2026-09-28 封堵作者远程控制：改为本地占位（必失败 → 回退本地 announcement.json）
+# 原值: https://gitee.com/ywtc000/dongye/raw/master/announcement.md
+DEFAULT_ANNOUNCEMENT_URL = "http://127.0.0.1:9/announcement-local.md"
 ANNOUNCEMENT_CACHE_FILE = DATA_DIR / "announcement_cache.json"
 _announcement_cache = {"content": None, "ts": 0}
 ANNOUNCEMENT_TTL = 300
@@ -1464,7 +1647,9 @@ async def get_announcement(_=Depends(verify_admin)):
 
 
 # ---------- 在线更新 ----------
-VERSION_CHECK_URL = "https://gitee.com/ywtc000/dongye/raw/master/version.json"
+# ★ 2026-09-28 封堵作者远程控制：不再连作者仓库查版本
+# 原值: https://gitee.com/ywtc000/dongye/raw/master/version.json
+VERSION_CHECK_URL = "http://127.0.0.1:9/version-local.json"
 _update_download_state = {
     "downloading": False,
     "progress": 0,
@@ -1967,8 +2152,11 @@ async def check_all(_=Depends(verify_admin)):
 # ============================================================
 # 预设模板（三层加载：远端热更新 → 内置兜底）
 # ============================================================
-PRESET_REMOTE_URL = "https://gitee.com/ywtc000/dongye/raw/master/presets.json"
-PRESET_DOC_URL = "https://pv284bk9no6.feishu.cn/wiki/HCOuwXuZGibDUGkWLlpcQuiLnDf"
+# ★ 2026-09-28 封堵作者远程控制：不再拉作者预设（防 base_url 被改成偷 key 的地址）
+# 原值: https://gitee.com/ywtc000/dongye/raw/master/presets.json
+PRESET_REMOTE_URL = "http://127.0.0.1:9/presets-local.json"
+# ★ 2026-09-28 封堵作者外链（原值: 作者飞书文档）
+PRESET_DOC_URL = ""
 PRESET_CACHE_TTL = 300
 
 # 内置兜底预设（断网保底；平台变更时改远端 presets.json 热更新即可，无需重新打包）
@@ -2131,6 +2319,272 @@ def _inject_cn_hint(body: dict):
 # ============================================================
 # 代理（客户端鉴权）
 # ============================================================
+async def _nonstream_via_stream(provider: dict, model: str, req_body: dict, used_key: str,
+                                 timeout: float = 600.0):
+    """内部流式聚合：用 stream=true 请求上游，读 SSE 聚合为标准非流式响应 dict。
+
+    - 流式每个 chunk 重置读计时器 → 免疫上游总生成时长超时
+    - 支持 delta.tool_calls 增量合并（按 index）→ agent 工具调用不丢
+    - 支持非 SSE 降级：上游忽略 stream 直接回 JSON 时也能解析
+
+    返回: (parsed_dict, usage_dict) ; 失败抛异常由调用方处理。
+    """
+    url = provider["base_url"].rstrip("/") + "/chat/completions"
+    body = copy.deepcopy(req_body)
+    body["stream"] = True
+    body.setdefault("stream_options", {"include_usage": True})
+    headers = {
+        "Authorization": f"Bearer {used_key}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+    }
+
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    usage_obj: dict = {}
+    finish_reason = None
+    resp_model = model
+    role = "assistant"
+
+    # tool_calls 增量合并：index -> {id, type, function:{name, arguments}}
+    tool_calls_accum: dict[int, dict] = {}
+    # 非 SSE 降级缓冲（首行不是 data: 时尝试整包 JSON）
+    plain_buf: list[str] = []
+
+    req = http_client.build_request("POST", url, json=body, headers=headers)
+    async with http_client.stream(
+        "POST", url, json=body, headers=headers,
+        timeout=httpx.Timeout(timeout, connect=15.0),
+    ) as resp:
+        if resp.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"upstream {resp.status_code}", request=req, response=resp
+            )
+        saw_data = False
+        async for line in resp.aiter_lines():
+            if not line:
+                continue
+            if not line.startswith("data: "):
+                if not saw_data:
+                    plain_buf.append(line)
+                continue
+            saw_data = True
+            payload = line[6:].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                obj = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("usage"):
+                usage_obj = obj["usage"]
+            if isinstance(obj.get("model"), str):
+                resp_model = model
+            for ch in (obj.get("choices") or []):
+                if ch.get("finish_reason"):
+                    finish_reason = ch["finish_reason"]
+                delta = ch.get("delta") or {}
+                if isinstance(delta.get("role"), str):
+                    role = delta["role"]
+                c = delta.get("content")
+                if isinstance(c, str) and c:
+                    content_parts.append(c)
+                rc = delta.get("reasoning_content")
+                if isinstance(rc, str) and rc:
+                    reasoning_parts.append(rc)
+                tc = delta.get("tool_calls")
+                if isinstance(tc, list):
+                    for call in tc:
+                        if not isinstance(call, dict):
+                            continue
+                        idx = call.get("index", 0)
+                        entry = tool_calls_accum.setdefault(idx, {
+                            "id": "", "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        })
+                        if call.get("id"):
+                            entry["id"] = call["id"]
+                        if call.get("type"):
+                            entry["type"] = call["type"]
+                        fn = call.get("function") or {}
+                        if fn.get("name"):
+                            entry["function"]["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            entry["function"]["arguments"] += fn["arguments"]
+
+    # 非 SSE 降级：上游直接返回了普通 JSON（忽略 stream=true）
+    if not saw_data and plain_buf:
+        raw = "".join(plain_buf).strip()
+        if raw.startswith("{"):
+            try:
+                obj = json.loads(raw)
+                return obj, (obj.get("usage") or {})
+            except json.JSONDecodeError:
+                pass
+
+    content = "".join(content_parts)
+    reasoning = "".join(reasoning_parts)
+    message: dict = {"role": role, "content": content}
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    if tool_calls_accum:
+        message["tool_calls"] = [
+            tool_calls_accum[i] for i in sorted(tool_calls_accum)
+        ]
+    if not content and not reasoning and not tool_calls_accum:
+        raise RuntimeError("stream-aggregate returned empty content")
+
+    parsed = {
+        "id": f"chatcmpl-agg-{int(time.time()*1000)}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": resp_model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason or "stop",
+        }],
+        "usage": usage_obj or {},
+    }
+    return parsed, usage_obj
+
+
+async def _try_stream_agg_first(candidates, body, is_router, prelude: str = ""):
+    """方案 C+ 主路径：非流式请求【始终先试】内部流式聚合。
+
+    语义沿用网关既有失败分类：
+      - 429 冷却：跳过 provider
+      - quota(429)：切 key 重试；全部 key 429 → 冷却 provider
+      - auth(401/403)：拉黑坏 key + 切 key
+      - request(400 等)：透传错误，整体 fallback 普通 POST（同一请求体 POST 可能可用）
+      - billing(402)：冷却 provider 1800s，fallback 普通 POST
+      - server(5xx)/连接/聚合异常：切 key 重试；仍失败 → 最后 fallback
+
+    返回: JSONResponse（成功）/ None（整体失败，调用方应 fallback 普通 POST）
+    """
+    async def _build_response(agg_parsed):
+        agg_parsed = merge_reasoning(agg_parsed)
+        _s = json.dumps(agg_parsed, ensure_ascii=False)
+        _s = restore_hermes_text(_s)
+        agg_parsed = json.loads(_s)
+        if prelude:
+            try:
+                _msg = agg_parsed["choices"][0]["message"]
+                _c = _msg.get("content")
+                if isinstance(_c, str) and _c:
+                    _msg["content"] = f"{prelude.rstrip()}\n\n{_c}"
+                elif isinstance(_c, str):
+                    _msg["content"] = prelude.rstrip()
+            except (KeyError, IndexError, TypeError):
+                pass
+        return JSONResponse(content=agg_parsed, status_code=200)
+
+    for attempt in (2,) if is_router else (1,):
+        if not any(not is_provider_429_cooling(p) for p, _ in candidates):
+            return None   # 全部冷却 → fallback（普通 POST 侧也会判冷却，语义一致）
+        for provider, model in candidates:
+            if is_provider_429_cooling(provider):
+                continue
+            k = f"{provider['name']}||{model}"
+            keys = _get_keys(provider)
+            max_key_tries = max(1, len(keys))
+            key_tried = 0
+            used_key = None
+            while key_tried < max_key_tries:
+                key_tried += 1
+                req_body = copy.deepcopy(body)
+                req_body["model"] = MODEL_ALIASES.get(model, model)
+                inject_provider_order(provider, req_body)
+                used_key = select_key(provider)
+                try:
+                    agg_parsed, agg_usage = await _nonstream_via_stream(
+                        provider, model, req_body, used_key)
+                except httpx.HTTPStatusError as hse:
+                    status = hse.response.status_code if hse.response is not None else 500
+                    ftype = classify_failure(status)
+                    detail = ""
+                    try:
+                        detail = (hse.response.text or "")[:300]
+                    except Exception:
+                        pass
+                    logger.warning("upstream %d from %s (stream-agg): %s", status, provider["name"], detail)
+                    append_call_log({
+                        "time": time.strftime("%H:%M:%S"), "provider": provider["name"],
+                        "model": model, "status": "fail", "tokens": 0,
+                        "error": f"HTTP {status}",
+                    })
+                    if ftype == "request":
+                        # 400 等请求错误：换 key 无用；POST 可能同样 400，但保底交给 fallback
+                        return None
+                    if ftype == "billing":
+                        mark_provider_429(provider, PROVIDER_BILLING_COOLDOWN_SECONDS)
+                        logger.info("provider %s 402 余额不足，冷却 %ds（fallback 普通 POST）", provider["name"], PROVIDER_BILLING_COOLDOWN_SECONDS)
+                        return None
+                    if ftype == "quota":
+                        on_key_failure(provider, status, bad_key=used_key)
+                        if key_tried < max_key_tries:
+                            logger.info("provider %s 429 限流，换下一个 Key 重试（%d/%d）", provider["name"], key_tried, max_key_tries)
+                            continue
+                        mark_provider_429(provider)
+                        logger.info("provider %s 全部 Key 均 429，冷却 %ds", provider["name"], PROVIDER_429_COOLDOWN_SECONDS)
+                        break
+                    record_fail(k)
+                    on_key_failure(provider, status, bad_key=used_key)
+                    if key_tried < max_key_tries:
+                        logger.info("provider %s HTTP %d，换下一个 Key 重试（%d/%d）", provider["name"], status, key_tried, max_key_tries)
+                        continue
+                    break
+                except httpx.RequestError as e:
+                    logger.warning("forward error to %s (stream-agg): %s", provider["name"], e)
+                    record_fail(k)
+                    on_key_failure(provider, bad_key=used_key)
+                    append_call_log({
+                        "time": time.strftime("%H:%M:%S"), "provider": provider["name"],
+                        "model": model, "status": "fail", "tokens": 0, "error": "连接失败",
+                    })
+                    if key_tried < max_key_tries:
+                        logger.info("provider %s 连接失败，换下一个 Key 重试（%d/%d）", provider["name"], key_tried, max_key_tries)
+                        continue
+                    break
+                except Exception as e:
+                    logger.warning("stream-agg forward error to %s: %s: %s", provider["name"], type(e).__name__, e)
+                    record_fail(k)
+                    on_key_failure(provider, bad_key=used_key)
+                    append_call_log({
+                        "time": time.strftime("%H:%M:%S"), "provider": provider["name"],
+                        "model": model, "status": "fail", "tokens": 0, "error": "流式聚合失败",
+                    })
+                    if key_tried < max_key_tries:
+                        logger.info("provider %s 聚合异常，换下一个 Key 重试（%d/%d）", provider["name"], key_tried, max_key_tries)
+                        continue
+                    break
+                # ------ 流式聚合成功 ------
+                try:
+                    _pt, _ct, _ch, _is_est = _usage_or_estimate(
+                        agg_usage, req_body.get("messages"), _extract_out_text(agg_parsed))
+                    _rec1 = {
+                        "ts": time.time(), "model": model,
+                        "provider": provider["name"],
+                        "pt": _pt, "ct": _ct, "tt": _pt + _ct, "cache_pt": _ch,
+                    }
+                    _cl1 = {
+                        "time": time.strftime("%H:%M:%S"), "provider": provider["name"],
+                        "model": model, "status": "ok", "tokens": _pt + _ct,
+                        "cached": _ch,
+                    }
+                    if _is_est:
+                        _rec1["estimated"] = True
+                        _cl1["estimated"] = True
+                    await append_usage(_rec1)
+                    append_call_log(_cl1)
+                except Exception:
+                    logger.exception("append_usage(stream-agg) failed")
+                record_success(k)
+                on_key_success(provider)
+                return await _build_response(agg_parsed)
+    return None
+
+
 async def _stream_with_failover(candidates, body, is_router, prelude: str = ""):
     """流式转发，中断时自动切换下一个候选模型继续输出。prelude 为先输出给用户的提示文本。"""
 
@@ -2324,20 +2778,26 @@ async def _stream_with_failover(candidates, body, is_router, prelude: str = ""):
                     record_success(k)
                     on_key_success(provider)
                     try:
-                        pt = (usage_obj or {}).get("prompt_tokens", 0) or 0
-                        ct = (usage_obj or {}).get("completion_tokens", 0) or 0
-                        await append_usage({
+                        pt, ct, ch, _is_est = _usage_or_estimate(
+                            usage_obj, req_body.get("messages"), accumulated)
+                        _rec2 = {
                             "ts": time.time(), "model": model,
                             "provider": provider["name"],
-                            "pt": pt, "ct": ct, "tt": pt + ct,
-                        })
-                        append_call_log({
+                            "pt": pt, "ct": ct, "tt": pt + ct, "cache_pt": ch,
+                        }
+                        _cl2 = {
                             "time": time.strftime("%H:%M:%S"),
                             "provider": provider["name"],
                             "model": model,
                             "status": "ok",
                             "tokens": pt + ct,
-                        })
+                            "cached": ch,
+                        }
+                        if _is_est:
+                            _rec2["estimated"] = True
+                            _cl2["estimated"] = True
+                        await append_usage(_rec2)
+                        append_call_log(_cl2)
                     except Exception:
                         logger.exception("append_usage(stream) failed")
                     return
@@ -2382,6 +2842,8 @@ async def proxy_chat(request: Request, force: bool = False):
     if isinstance(body.get("messages"), list):
         body["messages"] = sanitize_messages(body["messages"])
     requested_model = body.get("model")
+    # 按模型钳制 max_tokens（部分上游对超限值直接 400，如 mimo-v2.6-flash >131072）
+    clamp_max_tokens(body, requested_model or "")
 
     # 识图辅助：含图片且目标非识图组/识图模型 → 直接转交识图路由组
     vision_cfg = app_config.get("vision_assist", {})
@@ -2405,12 +2867,28 @@ async def proxy_chat(request: Request, force: bool = False):
     if not candidates:
         raise HTTPException(503, f"无可用的模型: {requested_model or '任意'}")
 
+    # 按候选模型的真实模型名钳制 max_tokens（路由名如 "1m" 查不到上限，
+    # 必须在 candidates 确定后按实际模型名再钳一次）
+    for _prov, _mdl in candidates:
+        clamp_max_tokens(body, _mdl)
+
     is_router = requested_model in ROUTERS
     stream = body.get("stream", False)
     last_err = None
 
     if stream:
         return await _stream_with_failover(candidates, body, is_router, prelude=vision_prelude)
+
+    # 方案 C+：非流式请求【始终先试】内部流式聚合——
+    # 流式按 chunk 重置读计时器，彻底免疫上游长输出超时（慢速上游可达 130s+）。
+    # 整体失败时 fallback 到下方原有普通 POST 逻辑（保留 timeout=120/换 key/冷却/错误透传）。
+    try:
+        _agg_first = await _try_stream_agg_first(candidates, body, is_router, vision_prelude)
+        if _agg_first is not None:
+            return _agg_first
+        logger.info("stream-agg 主路径未成功（返回 None），fallback 普通 POST")
+    except Exception as _agg_err:
+        logger.warning("stream-agg 主路径异常，fallback 普通 POST: %s: %s", type(_agg_err).__name__, _agg_err)
 
     if not force and not any(not is_provider_429_cooling(p) for p, _ in candidates):
         raise HTTPException(429, "上游限流冷却中，请稍后重试")
@@ -2517,22 +2995,28 @@ async def proxy_chat(request: Request, force: bool = False):
                         on_key_success(provider)
                         parsed["model"] = model
                         try:
-                            u = parsed.get("usage") or {}
-                            pt = u.get("prompt_tokens", 0) or 0
-                            ct = u.get("completion_tokens", 0) or 0
-                            await append_usage({
+                            pt, ct, ch, _is_est = _usage_or_estimate(
+                                parsed.get("usage"), req_body.get("messages"),
+                                _extract_out_text(parsed))
+                            _rec3 = {
                                 "ts": time.time(), "model": model,
                                 "provider": provider["name"],
-                                "pt": pt, "ct": ct, "tt": pt + ct,
-                            })
-                            # 调用日志记录
-                            append_call_log({
+                                "pt": pt, "ct": ct, "tt": pt + ct, "cache_pt": ch,
+                            }
+                            _cl3 = {
                                 "time": time.strftime("%H:%M:%S"),
                                 "provider": provider["name"],
                                 "model": model,
                                 "status": "ok",
                                 "tokens": pt + ct,
-                            })
+                                "cached": ch,
+                            }
+                            if _is_est:
+                                _rec3["estimated"] = True
+                                _cl3["estimated"] = True
+                            await append_usage(_rec3)
+                            # 调用日志记录
+                            append_call_log(_cl3)
                         except Exception:
                             logger.exception("append_usage(non-stream) failed")
                         try:
@@ -2567,6 +3051,69 @@ async def proxy_chat(request: Request, force: bool = False):
                             continue
                         break
                 except httpx.RequestError as e:
+                    # 方案 C：读超时 ≠ Key 故障。上游生成耗时长（如长输出 >120s）会触发
+                    # httpx.ReadTimeout（str 为空），此时换 Key 毫无意义（每把都要等满超时）。
+                    # 改用流式向同一上游重发一次并聚合——流式按 chunk 重置读计时器，不受总时长限制。
+                    is_timeout = isinstance(e, httpx.ReadTimeout)
+                    if is_timeout:
+                        try:
+                            logger.info("provider %s 读超时（%s），改用流式聚合同一上游重试", provider["name"], type(e).__name__)
+                            agg_parsed, agg_usage = await _nonstream_via_stream(provider, model, req_body, used_key)
+                            agg_parsed = merge_reasoning(agg_parsed)
+                            _s = json.dumps(agg_parsed, ensure_ascii=False)
+                            _s = restore_hermes_text(_s)
+                            agg_parsed = json.loads(_s)
+                            agg_parsed["model"] = model
+                            record_success(k)
+                            on_key_success(provider)
+                            try:
+                                _pt, _ct, _ch, _is_est = _usage_or_estimate(
+                                    agg_usage, req_body.get("messages"),
+                                    _extract_out_text(agg_parsed))
+                                _rec4 = {
+                                    "ts": time.time(), "model": model,
+                                    "provider": provider["name"],
+                                    "pt": _pt, "ct": _ct, "tt": _pt + _ct, "cache_pt": _ch,
+                                }
+                                _cl4 = {
+                                    "time": time.strftime("%H:%M:%S"),
+                                    "provider": provider["name"],
+                                    "model": model,
+                                    "status": "ok",
+                                    "tokens": _pt + _ct,
+                                    "cached": _ch,
+                                }
+                                if _is_est:
+                                    _rec4["estimated"] = True
+                                    _cl4["estimated"] = True
+                                await append_usage(_rec4)
+                                append_call_log(_cl4)
+                            except Exception:
+                                logger.exception("append_usage(stream-agg) failed")
+                            try:
+                                _msg = agg_parsed["choices"][0]["message"]
+                                _c = _msg.get("content")
+                                if vision_prelude and isinstance(_c, str) and _c:
+                                    _msg["content"] = f"{vision_prelude.rstrip()}\n\n{_c}"
+                                elif vision_prelude and isinstance(_c, str):
+                                    _msg["content"] = vision_prelude.rstrip()
+                            except (KeyError, IndexError, TypeError):
+                                pass
+                            logger.info("provider %s 流式聚合成功（非流式路径兜底）", provider["name"])
+                            return JSONResponse(content=agg_parsed, status_code=200)
+                        except Exception as agg_err:
+                            logger.warning("provider %s 流式聚合兜底也失败: %s: %s", provider["name"], type(agg_err).__name__, agg_err)
+                            # 聚合失败：不再换 Key（超时不是 Key 问题），直接路由下一候选
+                            last_err = f"timeout+stream-agg-failed: {type(agg_err).__name__}"
+                            append_call_log({
+                                "time": time.strftime("%H:%M:%S"),
+                                "provider": provider["name"],
+                                "model": model,
+                                "status": "fail",
+                                "tokens": 0,
+                                "error": "读超时(聚合兜底失败)",
+                            })
+                            break
                     logger.warning("forward error to %s: %s", provider["name"], e)
                     record_fail(k)
                     on_key_failure(provider, bad_key=used_key)

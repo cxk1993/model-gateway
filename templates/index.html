@@ -775,20 +775,21 @@ input:checked + .slider:before { transform: translateX(14px); }
         </span>
       </div>
     </div>
-    <div id="usageOverview" style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px;"></div>
+    <div id="usageOverview" style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 16px;"></div>
     <div class="table-container">
       <table>
         <thead>
           <tr>
             <th>渠道 · 模型</th>
             <th width="120">请求数</th>
-            <th width="160">输入 Token</th>
-            <th width="160">输出 Token</th>
-            <th width="160">合计 Token</th>
+            <th width="150">输入 Token</th>
+            <th width="150">缓存命中</th>
+            <th width="150">输出 Token</th>
+            <th width="150">合计 Token</th>
           </tr>
         </thead>
         <tbody id="usageBody">
-          <tr><td colspan="5" class="empty">加载中...</td></tr>
+          <tr><td colspan="6" class="empty">加载中...</td></tr>
         </tbody>
       </table>
     </div>
@@ -1304,8 +1305,10 @@ function fmtNum(n) {
 }
 function renderUsage(data) {
   const t = data.total || {};
+  const cacheRate = t.pt ? ((t.cache_pt || 0) / t.pt * 100) : 0;
   const cards = [
     { label: '输入 Token', value: t.pt },
+    { label: '缓存命中', value: t.cache_pt, sub: cacheRate.toFixed(1) + '% 命中率' },
     { label: '输出 Token', value: t.ct },
     { label: '合计 Token', value: t.tt },
     { label: '请求数', value: t.requests },
@@ -1314,6 +1317,7 @@ function renderUsage(data) {
     `<div class="provider-card" style="padding: 14px 16px;">
        <div style="font-size: 12px; color: var(--text-secondary);">${c.label}</div>
        <div style="font-size: 22px; font-weight: 600; color: var(--text-primary); margin-top: 4px;">${fmtNum(c.value)}</div>
+       ${c.sub ? `<div style="font-size: 11px; color: var(--text-secondary); margin-top: 2px;">${c.sub}</div>` : ''}
      </div>`
   ).join('');
   const rows = data.by_model || [];
@@ -1327,10 +1331,11 @@ function renderUsage(data) {
         </td>
         <td>${fmtNum(r.requests)}</td>
         <td>${fmtNum(r.pt)}</td>
+        <td>${fmtNum(r.cache_pt)}${r.pt ? ` <span style="color:var(--text-secondary);font-size:11px;">(${(100*(r.cache_pt||0)/r.pt).toFixed(0)}%)</span>` : ''}</td>
         <td>${fmtNum(r.ct)}</td>
-        <td>${fmtNum(r.tt)}</td>
+        <td>${fmtNum(r.tt)}${r.estimated ? ' <span style="color:var(--warning,#e6a23c);font-size:11px;">~估</span>' : ''}</td>
       </tr>`).join('')
-    : '<tr><td colspan="5" class="empty">暂无消耗记录</td></tr>';
+    : '<tr><td colspan="6" class="empty">暂无消耗记录</td></tr>';
 }
 
 function renderStability() {
