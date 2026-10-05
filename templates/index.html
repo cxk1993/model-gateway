@@ -653,7 +653,7 @@ input:checked + .slider:before { transform: translateX(14px); }
       </div>
       <div style="display: flex; gap: 12px;">
         <button class="btn" onclick="openRouterManager()">🔀 路由配置</button>
-        <button class="btn" onclick="openFeishuModal()" style="color: var(--danger)">📢 系统公告</button>
+        <button class="btn" onclick="openAnnouncementModal()" style="color: var(--danger)">📢 系统公告</button>
         <button class="btn" onclick="checkUpdate(false)">🔄 检查更新</button>
         <button class="btn btn-icon" onclick="toggleTheme()" id="themeBtn" title="切换深色/浅色模式">
           🌙
@@ -857,12 +857,12 @@ input:checked + .slider:before { transform: translateX(14px); }
 
 
 
-<!-- Feishu Modal -->
-<div class="modal-overlay" id="feishuModal" onclick="if(event.target===this) closeFeishuModal()">
+<!-- Announcement Modal -->
+<div class="modal-overlay" id="announcementModal" onclick="if(event.target===this) closeAnnouncementModal()">
   <div class="modal-content" style="max-width: 800px; height: 80vh; display:flex; flex-direction:column;">
     <div class="modal-header">
       <div class="modal-title">📢 系统公告</div>
-      <div class="mac-btn close" onclick="closeFeishuModal()" style="cursor: pointer;"></div>
+      <div class="mac-btn close" onclick="closeAnnouncementModal()" style="cursor: pointer;"></div>
     </div>
     <div class="modal-body" style="flex:1; padding:24px; overflow-y:auto;">
       <div id="announcementMeta" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid var(--mac-border);font-size:12px;color:var(--text-secondary);"></div>
@@ -2388,8 +2388,8 @@ function renderMarkdown(md) {
 
 let _lastAnnouncementHash = '';
 
-async function openFeishuModal() {
-  document.getElementById('feishuModal').classList.add('show');
+async function openAnnouncementModal() {
+  document.getElementById('announcementModal').classList.add('show');
   const body = document.getElementById('announcementBody');
   const meta = document.getElementById('announcementMeta');
   meta.style.display = 'none';
@@ -2405,8 +2405,8 @@ async function openFeishuModal() {
     if (e.message !== 'Unauthorized') { console.error(e); body.innerHTML = '<div class="empty" style="color:var(--danger)">加载失败</div>'; }
   }
 }
-function closeFeishuModal() {
-  document.getElementById('feishuModal').classList.remove('show');
+function closeAnnouncementModal() {
+  document.getElementById('announcementModal').classList.remove('show');
 }
 
 /* 定时检测公告变动 */
@@ -2417,7 +2417,7 @@ function startAnnouncementWatcher() {
       const d = await r.json();
       if (d.ok && d.hash && _lastAnnouncementHash && d.hash !== _lastAnnouncementHash) {
         _lastAnnouncementHash = d.hash;
-        openFeishuModal();
+        openAnnouncementModal();
       }
     } catch(e) {}
   }, 60000);
@@ -2756,7 +2756,7 @@ async function toggleAutostart(enabled) {
 function startApp() {
   loadModelDetails(); load(); updatePollStatus(); startPolling();
   loadAutostart();  // 加载开机自启状态
-  openFeishuModal();
+  openAnnouncementModal();
   setTimeout(function(){ checkUpdate(true); }, 2000);
   setTimeout(startAnnouncementWatcher, 5000);
 }

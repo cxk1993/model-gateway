@@ -1586,9 +1586,9 @@ async def vision_models_api(_=Depends(verify_admin)):
     return {"ok": True, "data": sorted(SUPPORTS_VISION.keys())}
 
 
-# ---------- 系统公告（Gitee 远程，本地兜底） ----------
-# ★ 2026-09-28 封堵作者远程控制：改为本地占位（必失败 → 回退本地 announcement.json）
-# 原值: https://gitee.com/ywtc000/dongye/raw/master/announcement.md
+# ---------- 系统公告（远程可选，本地兜底） ----------
+# 远程公告源默认关闭（安全默认）：留空或不可达时回退本地 announcement.json。
+# 如需远程公告，在 config.json 配置 announcement_url。
 DEFAULT_ANNOUNCEMENT_URL = "http://127.0.0.1:9/announcement-local.md"
 ANNOUNCEMENT_CACHE_FILE = DATA_DIR / "announcement_cache.json"
 _announcement_cache = {"content": None, "ts": 0}
@@ -1606,7 +1606,7 @@ def _announce_response(ok: bool, content: str) -> dict:
 
 @app.get("/api/announcement")
 async def get_announcement(_=Depends(verify_admin)):
-    """优先读 config.json 的 announcement_url（如 Gitee raw 链接）远程抓取；
+    """优先读 config.json 的 announcement_url（任意 raw 文本链接）远程抓取；
     未配置或抓取失败时回退到本地 announcement.json。远程结果缓存 5 分钟。"""
     cfg = load_config()
     url = cfg.get("announcement_url") or DEFAULT_ANNOUNCEMENT_URL
@@ -1647,8 +1647,8 @@ async def get_announcement(_=Depends(verify_admin)):
 
 
 # ---------- 在线更新 ----------
-# ★ 2026-09-28 封堵作者远程控制：不再连作者仓库查版本
-# 原值: https://gitee.com/ywtc000/dongye/raw/master/version.json
+# 远程版本源默认关闭（安全默认）。如需在线更新检查，
+# 在 config.json 配置 version_check_url。
 VERSION_CHECK_URL = "http://127.0.0.1:9/version-local.json"
 _update_download_state = {
     "downloading": False,
@@ -1686,7 +1686,7 @@ def _cleanup_old_exe():
 
 @app.get("/api/check-update")
 async def check_update(_=Depends(verify_admin)):
-    """检查 gitee 是否有新版本"""
+    """检查是否有新版本可用"""
     cfg = load_config()
     url = cfg.get("version_check_url") or VERSION_CHECK_URL
     try:
@@ -2150,12 +2150,12 @@ async def check_all(_=Depends(verify_admin)):
 
 
 # ============================================================
-# 预设模板（三层加载：远端热更新 → 内置兜底）
+# 预设模板（远端可选 → 内置兜底）
 # ============================================================
-# ★ 2026-09-28 封堵作者远程控制：不再拉作者预设（防 base_url 被改成偷 key 的地址）
-# 原值: https://gitee.com/ywtc000/dongye/raw/master/presets.json
+# 远程预设默认关闭（安全默认），使用下方内置兜底预设。
+# 如需远程热更新，在 config.json 配置 preset_remote_url。
 PRESET_REMOTE_URL = "http://127.0.0.1:9/presets-local.json"
-# ★ 2026-09-28 封堵作者外链（原值: 作者飞书文档）
+# 预设说明文档链接（默认留空）
 PRESET_DOC_URL = ""
 PRESET_CACHE_TTL = 300
 
