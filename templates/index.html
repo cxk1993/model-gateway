@@ -794,6 +794,40 @@ input:checked + .slider:before { transform: translateX(14px); }
       </table>
     </div>
 
+    <!-- 生图统计（按渠道·模型聚合张数） -->
+    <h2 style="font-size:16px; font-weight:600; margin-top:24px; margin-bottom:12px;">🖼️ 生图统计 <span id="imgStatsTotal" style="font-size:12px;font-weight:400;color:var(--text-secondary);"></span></h2>
+    <div id="imgOverview" style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px;"></div>
+    <div class="table-container">
+      <table>
+        <thead>
+          <tr>
+            <th>渠道 · 模型</th>
+            <th width="120">生成张数</th>
+            <th width="120">调用次数</th>
+            <th width="180">最近调用</th>
+          </tr>
+        </thead>
+        <tbody id="imgStatsBody">
+          <tr><td colspan="4" class="empty">暂无生图记录</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <h3 style="font-size:14px; font-weight:600; margin-top:16px; margin-bottom:10px; color:var(--text-secondary);">按天分布</h3>
+    <div class="table-container">
+      <table>
+        <thead>
+          <tr>
+            <th>日期</th>
+            <th width="160">生成张数</th>
+            <th width="160">调用次数</th>
+          </tr>
+        </thead>
+        <tbody id="imgDayBody">
+          <tr><td colspan="3" class="empty">暂无生图记录</td></tr>
+        </tbody>
+      </table>
+    </div>
+
     <!-- 调用日志 -->
     <h2 style="font-size:16px; font-weight:600; margin-top:24px; margin-bottom:12px;">📋 最近调用记录 <span style="font-size:12px;font-weight:400;color:var(--text-secondary);">（最多保留100条）</span></h2>
     <div class="table-container">
@@ -1278,6 +1312,64 @@ async function loadUsage() {
     if (e.message !== 'Unauthorized') console.error("Failed to load usage:", e);
   }
 }
+async function loadImageStats() {
+  try {
+    const r = await apiFetch(`/api/image-stats?days=${usageDays}`);
+    const data = await r.json();
+    renderImageStats(data);
+  } catch (e) {
+    if (e.message !== 'Unauthorized') console.error("loadImageStats failed:", e);
+  }
+}
+function renderImageStats(data) {
+  const t = (data && data.total) || {};
+  const el = document.getElementById('imgStatsTotal');
+  if (el) el.textContent = t.images ? `（近 ${data.days} 天共 ${fmtNum(t.images)} 张 / ${fmtNum(t.calls)} 次调用）` : '';
+  const body = document.getElementById('imgStatsBody');
+  if (!body) return;
+  // 汇总卡片
+  const ov = document.getElementById('imgOverview');
+  if (ov) {
+    const rowsAll = (data && data.by_model) || [];
+    const cards = [
+      { label: '生成张数', value: t.images },
+      { label: '调用次数', value: t.calls },
+      { label: '参与模型', value: rowsAll.length },
+    ];
+    ov.innerHTML = cards.map(c =>
+      `<div class="provider-card" style="padding: 14px 16px;">
+         <div style="font-size: 12px; color: var(--text-secondary);">${c.label}</div>
+         <div style="font-size: 22px; font-weight: 600; color: var(--text-primary); margin-top: 4px;">${fmtNum(c.value)}</div>
+       </div>`
+    ).join('');
+  }
+  // 按天分布
+  const dayBody = document.getElementById('imgDayBody');
+  if (dayBody) {
+    const days = (data && data.by_day) || [];
+    dayBody.innerHTML = days.length
+      ? days.map(d => `<tr>
+          <td style="font-size:13px;">${d.date}</td>
+          <td>${fmtNum(d.images)}</td>
+          <td>${fmtNum(d.calls)}</td>
+        </tr>`).join('')
+      : '<tr><td colspan="3" class="empty">暂无生图记录</td></tr>';
+  }
+  const rows = (data && data.by_model) || [];
+  body.innerHTML = rows.length
+    ? rows.map(r => `<tr>
+        <td>
+          <div class="model-name" style="display: flex; align-items: center;">
+            <span class="model-provider-badge">${r.provider || 'unknown'}</span>
+            <span>${r.model || 'unknown'}</span>
+          </div>
+        </td>
+        <td>${fmtNum(r.images)}</td>
+        <td>${fmtNum(r.calls)}</td>
+        <td style="font-size:12px;color:var(--text-secondary);">${r.last_ts ? new Date(r.last_ts * 1000).toLocaleString() : '-'}</td>
+      </tr>`).join('')
+    : '<tr><td colspan="4" class="empty">暂无生图记录</td></tr>';
+}
 function switchUsageTab(days) {
   usageDays = days;
   document.querySelectorAll('.usage-tab').forEach(b => {
@@ -1285,6 +1377,7 @@ function switchUsageTab(days) {
   });
   loadUsage();
   loadCallLog();
+  loadImageStats();
 }
 function switchUsageCustomTab() {
   const input = document.getElementById('usageCustomDays');
@@ -1296,6 +1389,7 @@ function switchUsageCustomTab() {
   document.querySelectorAll('.usage-tab').forEach(b => b.classList.remove('btn-primary'));
   loadUsage();
   loadCallLog();
+  loadImageStats();
 }
 function fmtNum(n) {
   n = n || 0;
@@ -1848,7 +1942,7 @@ function startPolling() {
   detailTimer = setInterval(loadModelDetails, 30000);
   callLogTimer = setInterval(() => {
     var uv = document.getElementById('usage-view');
-    if (uv && uv.style.display !== 'none') loadCallLog();
+    if (uv && uv.style.display !== 'none') { loadCallLog(); loadImageStats(); }
   }, 5000);
 }
 function stopPolling() {
@@ -1883,6 +1977,8 @@ function switchMainTab(tab) {
     highlightTabBtn(usageBtn);
     usageView.style.display = 'block';
     if (document.getElementById('usageOverview').innerHTML === '') loadUsage();
+  var _imgBody = document.getElementById('imgStatsBody');
+  if (_imgBody && _imgBody.querySelector('tr') && _imgBody.querySelector('.empty')) loadImageStats();
     loadUsageRetention();
     loadCallLog();
   }
@@ -2709,7 +2805,9 @@ async function loadCallLog() {
     tbody.innerHTML = data.slice().reverse().map(d => {
       const stIcon = d.status === 'ok' ? '✅' : '❌';
       const stColor = d.status === 'ok' ? 'var(--success)' : 'var(--danger)';
-      const tokens = d.tokens ? fmtTokens(d.tokens) : '-';
+      const tokens = (d.images !== undefined && d.images !== null && d.images !== 0)
+        ? `${d.images} 张`
+        : (d.tokens ? fmtTokens(d.tokens) : '-');
       const err = d.error ? ` <span style="font-size:11px;color:${stColor};">(${d.error})</span>` : '';
       return `<tr>
         <td style="font-size:12px;color:var(--text-secondary);">${d.time}</td>

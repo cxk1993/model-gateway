@@ -1,0 +1,7 @@
+*.bak*
+*.new*
+__pycache__
+*.pyc
+data/
+tests/
+dist/

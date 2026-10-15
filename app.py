@@ -58,6 +58,7 @@ DATA_FILE = DATA_DIR / "providers.json"
 CONFIG_FILE = DATA_DIR / "config.json"
 HISTORY_FILE = DATA_DIR / "history.jsonl"
 USAGE_FILE = DATA_DIR / "usage.jsonl"
+IMAGE_USAGE_FILE = DATA_DIR / "image_usage.jsonl"
 CALL_LOG_FILE = DATA_DIR / "call_log.jsonl"
 META_FILE = DATA_DIR / "models_meta.json"
 ROUTERS_FILE = DATA_DIR / "routers.json"
@@ -738,6 +739,9 @@ async def maybe_cleanup_history():
     cn = await asyncio.to_thread(_cleanup_call_log_sync)
     if cn:
         logger.info("call log cleanup: removed %d expired records", cn)
+    iun = await asyncio.to_thread(_cleanup_image_usage_sync)
+    if iun:
+        logger.info("image usage cleanup: removed %d expired records", iun)
 
 
 # ============================================================
@@ -751,6 +755,53 @@ def _append_usage_sync(record: dict):
 
 async def append_usage(record: dict):
     await asyncio.to_thread(_append_usage_sync, record)
+
+
+# 生图单独记账（以「张」为单位，与 token 口径分开统计）
+def _append_image_usage_sync(record: dict):
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    with open(IMAGE_USAGE_FILE, "a", encoding="utf-8") as f:
+        f.write(line)
+
+
+async def append_image_usage(record: dict):
+    await asyncio.to_thread(_append_image_usage_sync, record)
+
+
+def _read_image_usage_sync(days: int):
+    if not IMAGE_USAGE_FILE.exists():
+        return []
+    cutoff = time.time() - days * 86400
+    records = []
+    with open(IMAGE_USAGE_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                rec = json.loads(line.strip())
+                if rec.get("ts", 0) >= cutoff:
+                    records.append(rec)
+            except Exception:
+                pass
+    return records
+
+
+def _cleanup_image_usage_sync():
+    if not IMAGE_USAGE_FILE.exists():
+        return 0
+    cutoff = time.time() - get_usage_retention_days() * 86400
+    kept, removed = [], 0
+    with open(IMAGE_USAGE_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                rec = json.loads(line.strip())
+                if rec.get("ts", 0) >= cutoff:
+                    kept.append(line if line.endswith("\n") else line + "\n")
+                else:
+                    removed += 1
+            except Exception:
+                pass
+    if removed > 0:
+        atomic_write(IMAGE_USAGE_FILE, "".join(kept))
+    return removed
 
 
 def _read_usage_sync(days: int):
@@ -1499,6 +1550,39 @@ async def get_usage(days: int = 1, _=Depends(verify_admin)):
         for _, v in sorted(by_model.items(), key=lambda x: -x[1]["tt"])
     ]
     return {"days": days, "total": total, "by_day": by_day_list, "by_model": by_model_list}
+
+
+@app.get("/api/image-stats")
+async def get_image_stats(days: int = 0, _=Depends(verify_admin)):
+    """生图统计：按渠道·模型与按天聚合张数、调用次数（days=0 用保留期上限）"""
+    if days and days > 0:
+        days = max(1, min(days, get_usage_retention_days()))
+    else:
+        days = get_usage_retention_days()
+    records = await asyncio.to_thread(_read_image_usage_sync, days)
+    by_model = {}
+    by_day = {}
+    total = {"images": 0, "calls": 0}
+    for r in records:
+        m = r.get("model", "unknown")
+        pv = r.get("provider", "unknown")
+        n = int(r.get("images", 0) or 0)
+        ts = r.get("ts", 0)
+        mk = f"{pv} · {m}"
+        d = by_model.setdefault(mk, {"provider": pv, "model": m, "images": 0, "calls": 0, "last_ts": 0})
+        d["images"] += n
+        d["calls"] += 1
+        if ts > d["last_ts"]:
+            d["last_ts"] = ts
+        day = time.strftime("%Y-%m-%d", time.localtime(ts))
+        dd = by_day.setdefault(day, {"images": 0, "calls": 0})
+        dd["images"] += n
+        dd["calls"] += 1
+        total["images"] += n
+        total["calls"] += 1
+    rows = sorted(by_model.values(), key=lambda x: (-x["images"], -x["last_ts"]))
+    by_day_list = [{"date": d, **v} for d, v in sorted(by_day.items())]
+    return {"days": days, "total": total, "by_model": rows, "by_day": by_day_list}
 
 
 @app.get("/api/model-details")
@@ -3156,6 +3240,216 @@ async def proxy_chat(request: Request, force: bool = False):
         except Exception:
             pass
     raise HTTPException(502, f"所有候选模型均失败: {last_err}")
+
+
+# ============================================================
+# 生图：/v1/images/generations
+# ------------------------------------------------------------
+# 面向同步返回的生图渠道（gpt-image / DALL·E / Imagen / FLUX / Seedream 等）。
+# 与 /v1/chat/completions 的差异：
+#   * 上游路径为 /images/generations，超时放宽（出图较慢）
+#   * 无流式/SSE，纯 JSON 一进一出
+#   * 超时不换 Key 重试（上游可能已出图并计费），直接路由下一候选
+#   * 以「张」为单位单独记账（image_usage.jsonl），与 token 统计分开
+# ============================================================
+IMAGE_UPSTREAM_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
+
+
+@app.api_route("/v1/images/generations", methods=["POST"], dependencies=[Depends(verify_client)])
+async def proxy_images(request: Request, force: bool = False):
+    body = await request.json()
+    requested_model = body.get("model")
+
+    candidates = pick_available_models(requested_model, force=force)
+    if not candidates:
+        raise HTTPException(503, f"无可用的生图模型: {requested_model or '任意'}")
+
+    if not force and not any(not is_provider_429_cooling(p) for p, _ in candidates):
+        raise HTTPException(429, "上游限流冷却中，请稍后重试")
+
+    is_router = requested_model in ROUTERS
+    last_err = None
+
+    for _attempt in ((2,) if is_router else (1,)):
+        for provider, model in candidates:
+            if is_provider_429_cooling(provider):
+                logger.info("provider %s 429 冷却中，跳过", provider["name"])
+                continue
+            k = f"{provider['name']}||{model}"
+
+            keys = _get_keys(provider)
+            max_key_tries = max(1, len(keys))
+            key_tried = 0
+            used_key = None
+
+            while key_tried < max_key_tries:
+                key_tried += 1
+                req_body = copy.deepcopy(body)
+                req_body["model"] = MODEL_ALIASES.get(model, model)
+                used_key = select_key(provider)
+                url = provider["base_url"].rstrip("/") + "/images/generations"
+                headers = {
+                    "Authorization": f"Bearer {used_key}",
+                    "Content-Type": "application/json",
+                }
+
+                try:
+                    resp = await http_client.post(
+                        url, json=req_body, headers=headers, timeout=IMAGE_UPSTREAM_TIMEOUT)
+
+                    if resp.status_code >= 400:
+                        ftype = classify_failure(resp.status_code)
+                        err_detail = resp.text[:300]
+                        logger.warning("upstream %d from %s (images): %s",
+                                       resp.status_code, provider["name"], err_detail)
+                        if ftype == "request":
+                            last_err = f"upstream {resp.status_code}: {err_detail}"
+                            append_call_log({
+                                "time": time.strftime("%H:%M:%S"),
+                                "provider": provider["name"],
+                                "model": model,
+                                "status": "fail",
+                                "tokens": 0,
+                                "images": 0,
+                                "error": f"HTTP {resp.status_code} 请求参数错误",
+                            })
+                            break
+                        if ftype == "billing":
+                            mark_provider_429(provider, PROVIDER_BILLING_COOLDOWN_SECONDS)
+                            logger.info("provider %s 402 余额不足，冷却 %ds 后路由下一候选",
+                                        provider["name"], PROVIDER_BILLING_COOLDOWN_SECONDS)
+                            last_err = f"upstream {resp.status_code}"
+                            append_call_log({
+                                "time": time.strftime("%H:%M:%S"),
+                                "provider": provider["name"],
+                                "model": model,
+                                "status": "fail",
+                                "tokens": 0,
+                                "images": 0,
+                                "error": f"HTTP {resp.status_code} 余额不足",
+                            })
+                            break
+                        if ftype == "quota":
+                            on_key_failure(provider, resp.status_code, bad_key=used_key)
+                            last_err = f"upstream {resp.status_code}"
+                            append_call_log({
+                                "time": time.strftime("%H:%M:%S"),
+                                "provider": provider["name"],
+                                "model": model,
+                                "status": "fail",
+                                "tokens": 0,
+                                "images": 0,
+                                "error": f"HTTP {resp.status_code}",
+                            })
+                            if key_tried < max_key_tries:
+                                logger.info("provider %s 429 限流，换下一个 Key 重试（%d/%d）",
+                                            provider["name"], key_tried, max_key_tries)
+                                continue
+                            mark_provider_429(provider)
+                            break
+                        record_fail(k)
+                        on_key_failure(provider, resp.status_code, bad_key=used_key)
+                        last_err = f"upstream {resp.status_code}"
+                        append_call_log({
+                            "time": time.strftime("%H:%M:%S"),
+                            "provider": provider["name"],
+                            "model": model,
+                            "status": "fail",
+                            "tokens": 0,
+                            "images": 0,
+                            "error": f"HTTP {resp.status_code}",
+                        })
+                        if key_tried < max_key_tries:
+                            logger.info("provider %s HTTP %d，换下一个 Key 重试（%d/%d）",
+                                        provider["name"], resp.status_code, key_tried, max_key_tries)
+                            continue
+                        break
+
+                    try:
+                        parsed = json.loads(resp.text)
+                    except json.JSONDecodeError:
+                        logger.warning("upstream non-json from %s (images): %s",
+                                       provider["name"], resp.text[:200])
+                        record_fail(k)
+                        on_key_failure(provider, resp.status_code, bad_key=used_key)
+                        last_err = f"upstream non-json ({resp.status_code})"
+                        append_call_log({
+                            "time": time.strftime("%H:%M:%S"),
+                            "provider": provider["name"],
+                            "model": model,
+                            "status": "fail",
+                            "tokens": 0,
+                            "images": 0,
+                            "error": "响应格式错误",
+                        })
+                        if key_tried < max_key_tries:
+                            continue
+                        break
+
+                    record_success(k)
+                    on_key_success(provider)
+                    if isinstance(parsed, dict):
+                        parsed["model"] = model
+                    _imgs = 0
+                    if isinstance(parsed, dict) and isinstance(parsed.get("data"), list):
+                        _imgs = len(parsed["data"])
+                    append_call_log({
+                        "time": time.strftime("%H:%M:%S"),
+                        "provider": provider["name"],
+                        "model": model,
+                        "status": "ok",
+                        "tokens": 0,
+                        "images": _imgs,
+                    })
+                    await append_image_usage({
+                        "ts": time.time(), "model": model,
+                        "provider": provider["name"], "images": _imgs,
+                    })
+                    logger.info("provider %s 生图成功（%d 张）", provider["name"], _imgs)
+                    return JSONResponse(content=parsed, status_code=resp.status_code)
+
+                except httpx.RequestError as e:
+                    logger.warning("forward error to %s (images): %s", provider["name"], e)
+                    record_fail(k)
+                    on_key_failure(provider, bad_key=used_key)
+                    last_err = str(e)
+                    append_call_log({
+                        "time": time.strftime("%H:%M:%S"),
+                        "provider": provider["name"],
+                        "model": model,
+                        "status": "fail",
+                        "tokens": 0,
+                        "images": 0,
+                        "error": "连接失败/超时",
+                    })
+                    break
+                except Exception as e:
+                    logger.exception("unexpected forward error to %s (images)", provider["name"])
+                    record_fail(k)
+                    on_key_failure(provider, bad_key=used_key)
+                    last_err = str(e)
+                    append_call_log({
+                        "time": time.strftime("%H:%M:%S"),
+                        "provider": provider["name"],
+                        "model": model,
+                        "status": "fail",
+                        "tokens": 0,
+                        "images": 0,
+                        "error": "未知错误",
+                    })
+                    break
+
+    if isinstance(last_err, str) and last_err.startswith("upstream 4"):
+        try:
+            code = int(last_err.split()[1].rstrip(":"))
+            return JSONResponse(
+                content={"error": {"message": last_err,
+                                   "type": "invalid_request_error", "code": code}},
+                status_code=code,
+            )
+        except Exception:
+            pass
+    raise HTTPException(502, f"所有候选生图模型均失败: {last_err}")
 
 
 _models_cache = {"ts": 0, "data": None}
