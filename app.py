@@ -863,6 +863,26 @@ def is_chat_model(model_id: str) -> bool:
     return not any(kw in lower for kw in NON_CHAT_KEYWORDS)
 
 
+# 生图模型名判定（用于提供商分页：生图提供商 / LLM 提供商）
+_IMAGE_MODEL_KEYWORDS = (
+    "image", "dall-e", "dalle", "flux", "seedream", "banana", "imagen",
+    "sana", "stable-diffusion", "sdxl", "sd3", "midjourney", "recraft", "ideogram",
+)
+
+
+def is_image_model_name(model_id: str) -> bool:
+    lower = (model_id or "").lower()
+    return any(kw in lower for kw in _IMAGE_MODEL_KEYWORDS)
+
+
+def provider_kind(p: dict) -> str:
+    """提供商类型：模型全部为生图模型 → 'image'；其余（含空列表、混合）→ 'llm'"""
+    models = p.get("models") or []
+    if not models:
+        return "llm"
+    return "image" if all(is_image_model_name(m) for m in models) else "llm"
+
+
 def is_free_model(model_info: dict) -> bool:
     pricing = model_info.get("pricing", {})
     prompt_price = pricing.get("prompt", "")
@@ -1907,6 +1927,7 @@ async def list_providers(_=Depends(verify_admin)):
             "disabled_models": p.get("disabled_models", []),
             "free_only": p.get("free_only", True),
             "key_strategy": p.get("key_strategy", "sticky"),
+            "kind": provider_kind(p),
             "health": {},
         }
         for m in p.get("models", []):

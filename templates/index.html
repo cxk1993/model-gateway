@@ -711,6 +711,10 @@ input:checked + .slider:before { transform: translateX(14px); }
         <button class="btn btn-primary" onclick="openProviderEditor()" id="addProviderBtn">+ 添加提供商</button>
       </div>
     </div>
+    <div style="display: flex; gap: 8px; margin-bottom: 12px;">
+      <button id="provTab-llm" class="btn btn-primary" onclick="switchProviderTab('llm')">💬 LLM 提供商 <span id="provCountLlm" style="font-size:11px;color:var(--text-secondary);"></span></button>
+      <button id="provTab-image" class="btn" onclick="switchProviderTab('image')">🖼️ 生图提供商 <span id="provCountImage" style="font-size:11px;color:var(--text-secondary);"></span></button>
+    </div>
     <div class="providers-section" id="providersSection"></div>
 
     <div class="filter-bar">
@@ -1195,11 +1199,14 @@ async function load() {
     data = [];
     window.modelEnabledMap = {};
 
-    let providersHtml = '';
+    let providersHtml = { llm: '', image: '' };
+    let provCounts = { llm: 0, image: 0 };
     let providerOptionsHtml = '<option value="all">全部提供商</option>';
     list.forEach(p => {
       providerOptionsHtml += `<option value="${p.name}">${p.name}</option>`;
-      providersHtml += `
+      const _kind = (p.kind === 'image') ? 'image' : 'llm';
+      provCounts[_kind]++;
+      providersHtml[_kind] += `
         <div class="provider-card">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; gap: 6px; flex-wrap: wrap;">
             <div class="p-name" style="margin-bottom: 0;">${p.name} Configuration</div>
@@ -1234,7 +1241,12 @@ async function load() {
       });
     });
 
-    document.getElementById('providersSection').innerHTML = providersHtml;
+    window._providersHtml = providersHtml;
+    const _cl = document.getElementById('provCountLlm');
+    const _ci = document.getElementById('provCountImage');
+    if (_cl) _cl.textContent = provCounts.llm ? `(${provCounts.llm})` : '';
+    if (_ci) _ci.textContent = provCounts.image ? `(${provCounts.image})` : '';
+    renderProviderTab();
 
     const providerSelect = document.getElementById('providerFilter');
     const currentVal = providerSelect.value;
@@ -1250,6 +1262,26 @@ async function load() {
   }
 }
 
+let _providerTab = 'llm';
+function switchProviderTab(tab) {
+  _providerTab = tab;
+  const llmBtn = document.getElementById('provTab-llm');
+  const imgBtn = document.getElementById('provTab-image');
+  if (llmBtn) llmBtn.classList.toggle('btn-primary', tab === 'llm');
+  if (imgBtn) imgBtn.classList.toggle('btn-primary', tab === 'image');
+  renderProviderTab();
+}
+function renderProviderTab() {
+  const sec = document.getElementById('providersSection');
+  if (!sec || !window._providersHtml) return;
+  const html = window._providersHtml[_providerTab] || '';
+  if (html) { sec.innerHTML = html; return; }
+  sec.innerHTML = `<div style="padding:24px;text-align:center;color:var(--text-secondary);font-size:13px;">`
+    + (_providerTab === 'image'
+      ? '暂无生图提供商 —— 点击「+ 添加提供商」新增；模型名含 image / flux / seedream / sana 等会自动归入本页'
+      : '暂无 LLM 提供商')
+    + `</div>`;
+}
 async function loadStability() {
   const hours = document.getElementById('stabilityHours').value;
   try {
