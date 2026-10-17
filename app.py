@@ -876,7 +876,10 @@ def is_image_model_name(model_id: str) -> bool:
 
 
 def provider_kind(p: dict) -> str:
-    """提供商类型：模型全部为生图模型 → 'image'；其余（含空列表、混合）→ 'llm'"""
+    """提供商类型：显式 kind 优先；未设置时按模型名推断（全为生图模型→image，否则 llm）"""
+    explicit = (p.get("kind") or "").strip().lower()
+    if explicit in ("llm", "image"):
+        return explicit
     models = p.get("models") or []
     if not models:
         return "llm"
@@ -1285,6 +1288,7 @@ class ProviderIn(BaseModel):
     models: list[str] = []
     free_only: bool = True
     key_strategy: str = "sticky"
+    kind: str | None = None
 
 
 class ProviderUpdate(BaseModel):
@@ -1295,6 +1299,7 @@ class ProviderUpdate(BaseModel):
     models: list[str] | None = None
     free_only: bool | None = None
     key_strategy: str | None = None
+    kind: str | None = None
 
 
 class ToggleModelIn(BaseModel):
@@ -1960,6 +1965,12 @@ async def add_provider(data: ProviderIn, _=Depends(verify_admin)):
         pd = data.model_dump()
         pd["api_keys"] = keys
         pd.pop("api_key", None)
+        # 提供商类型：仅接受 llm / image，其余按自动识别处理
+        _k = (pd.get("kind") or "").strip().lower()
+        if _k in ("llm", "image"):
+            pd["kind"] = _k
+        else:
+            pd.pop("kind", None)
         # 校验 key 策略
         if pd.get("key_strategy") not in VALID_KEY_STRATEGIES:
             pd["key_strategy"] = "sticky"
@@ -2144,6 +2155,14 @@ async def update_provider(name: str, data: ProviderUpdate, _=Depends(verify_admi
                 # 校验 key 策略
                 if updates.get("key_strategy") not in VALID_KEY_STRATEGIES:
                     updates.pop("key_strategy", None)
+                # 提供商类型：仅接受 llm / image，空值表示恢复自动识别
+                if "kind" in updates:
+                    _k = (updates.get("kind") or "").strip().lower()
+                    if _k in ("llm", "image"):
+                        updates["kind"] = _k
+                    else:
+                        updates.pop("kind", None)
+                        p.pop("kind", None)
                 providers[i].update(updates)
                 save_providers(providers)
                 return {"ok": True}

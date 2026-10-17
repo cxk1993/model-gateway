@@ -998,6 +998,20 @@ input:checked + .slider:before { transform: translateX(14px); }
         <div class="form-hint" id="pf_name_hint" style="display:none;">编辑模式下名称不可修改</div>
       </div>
       <div class="form-field">
+        <label>提供商类型</label>
+        <div style="display:flex; gap:18px; align-items:center; margin-top:6px;">
+          <label class="form-check" style="margin:0;">
+            <input type="radio" name="pf_kind" value="llm" checked>
+            <span>💬 LLM（对话 / 文本）</span>
+          </label>
+          <label class="form-check" style="margin:0;">
+            <input type="radio" name="pf_kind" value="image">
+            <span>🖼️ 生图</span>
+          </label>
+        </div>
+        <div class="form-hint">不选也行：模型名含 image / flux / seedream / sana 等会自动归入生图</div>
+      </div>
+      <div class="form-field">
         <label>Base URL</label>
         <input type="text" id="pf_base_url" placeholder="https://api.example.com/v1">
       </div>
@@ -1704,6 +1718,7 @@ async function openProviderEditor(name) {
       const list = await r.json();
       const p = list.find(x => x.name === name) || {};
       document.getElementById('pf_base_url').value = p.base_url || '';
+      _setProviderKind(p.kind || '');
     } catch (e) { if (e.message !== 'Unauthorized') console.error(e); }
     document.getElementById('pf_api_key').value = '';
     document.getElementById('pf_api_key').placeholder = '留空表示不修改密钥';
@@ -1717,6 +1732,7 @@ async function openProviderEditor(name) {
     document.getElementById('pf_base_url').value = '';
     document.getElementById('pf_api_key').value = '';
     document.getElementById('pf_api_key').placeholder = 'sk-...';
+    _setProviderKind('llm');
   }
   document.getElementById('pf_show_key').checked = false;
   document.getElementById('pf_api_key').type = 'password';
@@ -1764,6 +1780,14 @@ function showProviderMsg(msg, type) {
   el.style.display = 'block';
 }
 
+function _setProviderKind(kind) {
+  const k = (kind === 'image') ? 'image' : 'llm';
+  document.querySelectorAll('input[name="pf_kind"]').forEach(r => { r.checked = (r.value === k); });
+}
+function _getProviderKind() {
+  const el = document.querySelector('input[name="pf_kind"]:checked');
+  return el ? el.value : 'llm';
+}
 async function submitProviderForm() {
   const name = document.getElementById('pf_name').value.trim();
   const baseUrl = document.getElementById('pf_base_url').value.trim();
@@ -1788,10 +1812,10 @@ async function submitProviderForm() {
       res = await apiFetch('/api/providers', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, base_url: baseUrl, api_key: apiKey, free_only: freeOnly })
+        body: JSON.stringify({ name, base_url: baseUrl, api_key: apiKey, free_only: freeOnly, kind: _getProviderKind() })
       });
     } else {
-      const body = { base_url: baseUrl, free_only: freeOnly };
+      const body = { base_url: baseUrl, free_only: freeOnly, kind: _getProviderKind() };
       if (apiKey) body.api_key = apiKey;
       res = await apiFetch('/api/providers/' + encodeURIComponent(providerEditName), {
         method: 'PUT',
