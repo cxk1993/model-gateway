@@ -1,4 +1,5 @@
 import json
+import base64
 import asyncio
 import time
 import os
@@ -3293,6 +3294,37 @@ async def proxy_chat(request: Request, force: bool = False):
 #   * 以「张」为单位单独记账（image_usage.jsonl），与 token 统计分开
 # ============================================================
 IMAGE_UPSTREAM_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
+IMAGE_DOWNLOAD_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
+
+
+async def _inline_image_urls(parsed, want_url: bool = False):
+    """Inline image results that come back as temporary URLs into b64_json.
+
+    Some upstreams return only a short-lived link; clients would otherwise need a
+    second request (and fail once the link expires). Download failures, or an
+    explicit ``response_format: url`` from the client, leave the response untouched.
+    """
+    if want_url or not isinstance(parsed, dict):
+        return parsed
+    items = parsed.get("data")
+    if not isinstance(items, list):
+        return parsed
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url")
+        if not url or item.get("b64_json"):
+            continue
+        try:
+            r = await http_client.get(url, timeout=IMAGE_DOWNLOAD_TIMEOUT)
+            if r.status_code == 200 and r.content:
+                item["b64_json"] = base64.b64encode(r.content).decode("ascii")
+                item.pop("url", None)
+            else:
+                logger.warning("image download failed (HTTP %s), keeping url", r.status_code)
+        except Exception as e:
+            logger.warning("image download error, keeping url: %s", e)
+    return parsed
 
 
 @app.api_route("/v1/images/generations", methods=["POST"], dependencies=[Depends(verify_client)])
@@ -3326,6 +3358,11 @@ async def proxy_images(request: Request, force: bool = False):
                 key_tried += 1
                 req_body = copy.deepcopy(body)
                 req_body["model"] = MODEL_ALIASES.get(model, model)
+                # Provider-level defaults (e.g. watermark=false); client values win
+                _eb = provider.get("extra_body") or {}
+                if isinstance(_eb, dict):
+                    for _k, _v in _eb.items():
+                        req_body.setdefault(_k, _v)
                 used_key = select_key(provider)
                 url = provider["base_url"].rstrip("/") + "/images/generations"
                 headers = {
@@ -3428,6 +3465,9 @@ async def proxy_images(request: Request, force: bool = False):
 
                     record_success(k)
                     on_key_success(provider)
+                    # Inline temporary URLs into b64_json unless the client asked for urls
+                    parsed = await _inline_image_urls(
+                        parsed, want_url=(body.get("response_format") == "url"))
                     if isinstance(parsed, dict):
                         parsed["model"] = model
                     _imgs = 0
